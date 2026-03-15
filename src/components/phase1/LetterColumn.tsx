@@ -101,7 +101,7 @@ export default function LetterColumn({
   const accentColor = ACCENT_COLORS[label] ?? 'bg-slate-400';
 
   return (
-    <div className="flex flex-col bg-white border border-slate-200/80 rounded-lg shadow-sm hover:shadow-md overflow-hidden relative transition-shadow duration-300 ease-out">
+    <div className="flex flex-col bg-white border border-slate-200/80 rounded-lg shadow-sm overflow-hidden relative transition-shadow duration-200 ease-out">
       {/* Header with accent bar */}
       <div className="shrink-0">
         <div className={`h-[2.5px] ${accentColor} transition-all duration-300`} />

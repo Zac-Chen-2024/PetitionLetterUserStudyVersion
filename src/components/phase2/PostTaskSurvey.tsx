@@ -64,7 +64,7 @@ const SCALE_LABELS = [
   'Strongly Agree',
 ];
 
-// Idle: all neutral gray outline, no color
+// Idle: all neutral gray outline
 const IDLE_COLORS = [
   'border-slate-300 hover:border-slate-400',
   'border-slate-300 hover:border-slate-400',
@@ -75,14 +75,15 @@ const IDLE_COLORS = [
   'border-slate-300 hover:border-slate-400',
 ];
 
+// Unified blue palette for selected state (darker = more extreme)
 const SELECTED_COLORS = [
-  'bg-red-600 border-red-600 text-white shadow-md',
-  'bg-red-500 border-red-500 text-white shadow-md',
-  'bg-red-400 border-red-400 text-white shadow-md',
-  'bg-slate-500 border-slate-500 text-white shadow-md',
-  'bg-green-400 border-green-400 text-white shadow-md',
-  'bg-green-500 border-green-500 text-white shadow-md',
-  'bg-green-600 border-green-600 text-white shadow-md',
+  'bg-blue-700 border-blue-700 text-white',
+  'bg-blue-600 border-blue-600 text-white',
+  'bg-blue-500 border-blue-500 text-white',
+  'bg-blue-400 border-blue-400 text-white',
+  'bg-blue-500 border-blue-500 text-white',
+  'bg-blue-600 border-blue-600 text-white',
+  'bg-blue-700 border-blue-700 text-white',
 ];
 
 export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
@@ -96,70 +97,67 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
   };
 
   return (
-    <div className="w-full px-16 py-10 overflow-y-auto h-full custom-scrollbar">
+    <div className="w-full px-8 py-8 overflow-y-auto h-full custom-scrollbar">
       {/* Header */}
-      <div className="mb-10">
-        <h2 className="text-[36px] font-bold text-slate-900 mb-3 tracking-tight">{t('postTask.title')}</h2>
-        <p className="text-[22px] text-slate-500 leading-relaxed">
+      <div className="mb-8">
+        <h2 className="text-2xl font-semibold text-slate-900 mb-2 tracking-tight">{t('postTask.title')}</h2>
+        <p className="text-sm text-slate-500 leading-relaxed">
           Please rate your agreement with each statement on a 7-point scale.
         </p>
       </div>
 
       {/* Scale legend bar */}
-      <div className="rounded-xl border border-slate-200/80 bg-gradient-to-r from-red-50 via-slate-50 to-green-50 px-8 py-5 mb-8 flex items-center justify-between shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
-        <span className="text-[18px] font-semibold text-red-500">1 = Strongly Disagree</span>
-        <div className="flex gap-8">
+      <div className="rounded-lg border border-slate-200/80 bg-slate-50 px-6 py-4 mb-6 flex items-center justify-between">
+        <span className="text-xs font-semibold text-slate-500">1 = Strongly Disagree</span>
+        <div className="flex gap-6">
           {SCALE_LABELS.map((label, i) => (
-            <div key={i} className="flex flex-col items-center gap-1">
-              <span className="text-[17px] font-bold text-slate-700">{i + 1}</span>
-              <span className="text-[13px] text-slate-400 leading-tight text-center w-16">{label}</span>
+            <div key={i} className="flex flex-col items-center gap-0.5">
+              <span className="text-sm font-semibold text-slate-700">{i + 1}</span>
+              <span className="text-[11px] text-slate-400 leading-tight text-center w-14">{label}</span>
             </div>
           ))}
         </div>
-        <span className="text-[18px] font-semibold text-green-600">7 = Strongly Agree</span>
+        <span className="text-xs font-semibold text-slate-500">7 = Strongly Agree</span>
       </div>
 
       {/* Questions */}
-      <div className="space-y-6">
+      <div className="space-y-4">
         {QUESTIONS.map((q, qIdx) => {
           const selected = responses[q.id] as number | undefined;
           return (
             <div
               key={q.id}
-              className={`rounded-2xl border-2 p-8 transition-all duration-300 ease-out ${
+              className={`rounded-xl border p-5 transition-all duration-200 ease-out ${
                 selected !== undefined
                   ? 'border-blue-200/80 bg-blue-50/30 shadow-[0_2px_8px_rgba(59,130,246,0.06)]'
                   : 'border-slate-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.06)]'
               }`}
             >
               {/* Question text */}
-              <div className="flex gap-5 mb-7">
-                <div className={`w-12 h-12 rounded-full flex items-center justify-center text-[22px] font-bold shrink-0 transition-all duration-300 ease-out ${
+              <div className="flex gap-4 mb-4">
+                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold shrink-0 transition-all duration-200 ease-out ${
                   selected !== undefined
                     ? 'bg-blue-600 text-white shadow-[0_2px_6px_rgba(37,99,235,0.25)]'
-                    : 'bg-slate-800 text-white'
+                    : 'bg-slate-600 text-white'
                 }`}>
                   {qIdx + 1}
                 </div>
-                <div className="pt-1">
-                  <h3 className="text-[24px] font-bold text-slate-900 tracking-tight">{q.label}</h3>
-                  <p className="text-[19px] text-slate-500 mt-2 leading-relaxed">{q.desc}</p>
+                <div className="pt-0.5">
+                  <h3 className="text-base font-semibold text-slate-900 tracking-tight">{q.label}</h3>
+                  <p className="text-sm text-slate-500 mt-1 leading-relaxed">{q.desc}</p>
                 </div>
               </div>
 
               {/* 7-point Likert scale */}
-              <div className="flex items-center px-6">
-                <span className="text-[18px] font-medium text-slate-400 w-32 text-right pr-6 shrink-0 leading-snug">
+              <div className="flex items-center px-4">
+                <span className="text-xs font-medium text-slate-400 w-24 text-right pr-4 shrink-0 leading-snug">
                   Strongly<br />Disagree
                 </span>
 
-                <div className="flex items-center gap-5 flex-1 justify-center">
+                <div className="flex items-center gap-3 flex-1 justify-center">
                   {SCALE_LABELS.map((label, i) => {
                     const value = i + 1;
                     const isSelected = selected === value;
-                    const distance = Math.abs(i - 3);
-                    const sizes = ['w-12 h-12', 'w-[52px] h-[52px]', 'w-14 h-14', 'w-16 h-16'];
-                    const sizeClass = sizes[distance];
 
                     return (
                       <button
@@ -167,7 +165,7 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
                         onClick={() => handleSelect(q.id, value)}
                         title={label}
                         className={`
-                          ${sizeClass} rounded-full border-[3px] flex items-center justify-center text-[19px] font-bold cursor-pointer
+                          w-10 h-10 rounded-full border-2 flex items-center justify-center text-sm font-semibold cursor-pointer
                           transition-all duration-200 ease-out
                           ${isSelected
                             ? `${SELECTED_COLORS[i]} likert-select`
@@ -181,7 +179,7 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
                   })}
                 </div>
 
-                <span className="text-[18px] font-medium text-slate-400 w-32 pl-6 shrink-0 leading-snug">
+                <span className="text-xs font-medium text-slate-400 w-24 pl-4 shrink-0 leading-snug">
                   Strongly<br />Agree
                 </span>
               </div>
@@ -191,14 +189,14 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
       </div>
 
       {/* Submit */}
-      <div className="mt-10 pb-10">
+      <div className="mt-8 pb-8">
         <button
           onClick={() => onSubmit(responses)}
           disabled={!allAnswered}
           className={`
-            w-full py-5 rounded-2xl text-[22px] font-bold transition-all duration-300 ease-out
+            w-full py-3 rounded-lg text-sm font-semibold transition-all duration-200 ease-out
             ${allAnswered
-              ? 'bg-slate-800 text-white hover:bg-slate-900 active:scale-[0.99] shadow-[0_2px_8px_rgba(15,23,42,0.2)] hover:shadow-[0_4px_12px_rgba(15,23,42,0.25)]'
+              ? 'bg-blue-600 text-white hover:bg-blue-700 active:scale-[0.99] shadow-sm hover:shadow-md'
               : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
             }
           `}
