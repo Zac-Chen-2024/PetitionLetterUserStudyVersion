@@ -18,6 +18,7 @@ const ACCENT_COLORS: Record<string, string> = {
 interface LetterColumnProps {
   label: string;
   sections: PetitionSection[];
+  fontSize?: number;
   columnIndex: number;
   onScroll?: (event: ScrollEvent) => void;
   onScoringRevealed?: (columnIndex: number) => void;
@@ -31,7 +32,7 @@ interface LetterColumnProps {
 }
 
 export default function LetterColumn({
-  label, sections, columnIndex, onScroll, onScoringRevealed,
+  label, sections, fontSize = 16, columnIndex, onScroll, onScoringRevealed,
   dimensions, scores, onScoreChange, comment, onCommentChange,
   isScored, forceShowScoring,
 }: LetterColumnProps) {
@@ -100,17 +101,17 @@ export default function LetterColumn({
   const accentColor = ACCENT_COLORS[label] ?? 'bg-slate-400';
 
   return (
-    <div className="flex flex-col bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden relative">
+    <div className="flex flex-col bg-white border border-slate-200/80 rounded-lg shadow-sm hover:shadow-md overflow-hidden relative transition-shadow duration-300 ease-out">
       {/* Header with accent bar */}
       <div className="shrink-0">
-        <div className={`h-[2px] ${accentColor}`} />
-        <div className="px-4 py-2.5 border-b border-slate-100 flex items-center gap-2">
-          <span className={`px-2.5 py-1 rounded-md text-xs font-semibold ${badgeClass}`}>
+        <div className={`h-[2.5px] ${accentColor} transition-all duration-300`} />
+        <div className="px-4 py-2.5 border-b border-slate-100/80 flex items-center gap-2">
+          <span className={`px-2.5 py-1 rounded-md text-xs font-semibold tracking-tight ${badgeClass}`}>
             {label}
           </span>
           {/* Completion checkmark */}
           {isScored && (
-            <span className="flex items-center justify-center w-5 h-5 rounded-full bg-emerald-100 text-emerald-600 scoring-enter">
+            <span className="flex items-center justify-center w-5 h-5 rounded-full bg-emerald-50 text-emerald-500 scoring-enter shadow-[0_0_0_2px_rgba(16,185,129,0.08)]">
               <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
               </svg>
@@ -123,23 +124,23 @@ export default function LetterColumn({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto"
+        className="flex-1 overflow-y-auto custom-scrollbar"
       >
         {/* Letter text */}
         <div className="px-4 py-4 space-y-4">
           {sections.map((section, idx) => (
             <div key={idx}>
-              <h3 className="text-sm font-semibold text-slate-800 mb-1">{section.heading}</h3>
-              <p className="text-sm text-slate-600 leading-relaxed text-justify">{section.content}</p>
+              <h3 className="font-semibold text-slate-800 mb-1.5 tracking-tight" style={{ fontSize: `${fontSize}px` }}>{section.heading}</h3>
+              <p className="text-slate-600 leading-relaxed text-justify" style={{ fontSize: `${fontSize}px` }}>{section.content}</p>
             </div>
           ))}
         </div>
 
-        {/* Inline scoring — revealed when scrolled to bottom or forced */}
+        {/* Inline scoring -- revealed when scrolled to bottom or forced */}
         {showScoring && (
-          <div ref={scoringRef} className={`bg-slate-50 px-4 py-4 ${forceShowScoring ? '' : 'scoring-enter'}`}>
+          <div ref={scoringRef} className={`bg-slate-50/80 px-4 py-4 ${forceShowScoring ? '' : 'scoring-enter'}`}>
             {/* Animated blue divider line */}
-            <div className={`h-[2px] bg-blue-500 rounded-full mb-4 ${forceShowScoring ? '' : 'divider-expand'}`} />
+            <div className={`h-[2px] bg-blue-500/80 rounded-full mb-4 ${forceShowScoring ? '' : 'divider-expand'}`} />
 
             {/* Scoring header with icon */}
             <div className={forceShowScoring ? '' : 'scoring-controls-enter'}>
@@ -151,7 +152,7 @@ export default function LetterColumn({
                   {t('phase1.scoringTitle')}
                 </span>
               </div>
-              <p className="text-[10px] text-slate-400 mb-3">
+              <p className="text-[10px] text-slate-400 mb-3 leading-relaxed">
                 {t('phase1.scoringInstruction')}
               </p>
 
@@ -173,9 +174,9 @@ export default function LetterColumn({
                   placeholder={t('phase1.commentPlaceholder')}
                   rows={2}
                   maxLength={500}
-                  className="w-full px-2.5 py-1.5 text-xs border border-slate-200 bg-white rounded-md resize-none focus:outline-none focus:ring-2 focus:ring-blue-400/30 focus:border-blue-400 transition-all duration-200"
+                  className="w-full px-2.5 py-2 text-xs border border-slate-200 bg-white rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-blue-400/20 focus:border-blue-400 transition-all duration-200 ease-out placeholder:text-slate-300"
                 />
-                <span className="absolute bottom-2 right-2 text-[9px] text-slate-300 tabular-nums">
+                <span className="absolute bottom-2 right-2.5 text-[9px] text-slate-300 tabular-nums">
                   {comment.length}/500
                 </span>
               </div>
@@ -187,11 +188,13 @@ export default function LetterColumn({
       {/* Scroll gradient hint overlay */}
       {showScrollHint && (
         <div className="absolute bottom-0 left-0 right-0 pointer-events-none">
-          <div className="h-16 bg-gradient-to-t from-white via-white/80 to-transparent" />
-          <div className="absolute bottom-2 left-1/2 -translate-x-1/2 bounce-arrow">
-            <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
-            </svg>
+          <div className="h-20 bg-gradient-to-t from-white via-white/70 to-transparent" />
+          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bounce-arrow">
+            <div className="w-8 h-8 rounded-full bg-white/90 shadow-sm flex items-center justify-center">
+              <svg className="w-4 h-4 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+              </svg>
+            </div>
           </div>
         </div>
       )}

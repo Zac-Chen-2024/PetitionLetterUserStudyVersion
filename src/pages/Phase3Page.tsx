@@ -23,33 +23,33 @@ export default function Phase3Page() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header — same style as Phase 1 & 2 */}
-      <div className="px-6 py-3 border-b border-slate-200 shrink-0">
-        <h1 className="text-lg font-semibold text-slate-800">Phase 3/3: Subjective Feedback</h1>
-        <p className="text-sm text-slate-600 mt-1">Share your thoughts about the system.</p>
+      {/* Header -- same style as Phase 1 & 2 */}
+      <div className="px-6 py-3 border-b border-slate-200/80 bg-white/80 backdrop-blur-sm shrink-0">
+        <h1 className="text-lg font-semibold text-slate-800 tracking-tight">Phase 3/3: Subjective Feedback</h1>
+        <p className="text-sm text-slate-500 mt-1">Share your thoughts about the system.</p>
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto custom-scrollbar">
         <div className="w-full px-16 py-10">
-          <h2 className="text-[28px] font-bold text-slate-900 mb-3">Open Feedback</h2>
-          <p className="text-[18px] text-slate-500 mb-5">Please share any additional thoughts, and comments about your experience.</p>
+          <h2 className="text-[28px] font-bold text-slate-900 mb-3 tracking-tight">Open Feedback</h2>
+          <p className="text-[18px] text-slate-500 mb-6 leading-relaxed">Please share any additional thoughts, and comments about your experience.</p>
           <textarea
             value={responses.openFeedback as string}
             onChange={(e) => setResponses({ openFeedback: e.target.value })}
             placeholder="Your thoughts..."
             rows={10}
-            className="w-full px-5 py-4 border-2 border-slate-200 rounded-xl text-[18px] focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none"
+            className="w-full px-5 py-4 border-2 border-slate-200 rounded-xl text-[18px] leading-relaxed focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 resize-none transition-all duration-200 ease-out placeholder:text-slate-300 hover:border-slate-300"
           />
 
           <button
             onClick={handleSubmit}
             disabled={!canSubmit}
             className={`
-              w-full mt-8 py-5 rounded-2xl text-[22px] font-bold transition-all duration-300
+              w-full mt-8 py-5 rounded-2xl text-[22px] font-bold transition-all duration-300 ease-out
               ${canSubmit
-                ? 'bg-slate-800 text-white hover:bg-slate-900 shadow-lg'
-                : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                ? 'bg-slate-800 text-white hover:bg-slate-900 active:scale-[0.99] shadow-[0_2px_8px_rgba(15,23,42,0.2)] hover:shadow-[0_4px_12px_rgba(15,23,42,0.25)]'
+                : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
               }
             `}
           >

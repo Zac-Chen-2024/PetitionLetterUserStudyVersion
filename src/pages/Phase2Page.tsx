@@ -38,13 +38,13 @@ export default function Phase2Page() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header — single row */}
-      <div className="px-6 py-2.5 border-b border-slate-200 shrink-0 flex items-center justify-between">
-        <h1 className="text-lg font-semibold text-slate-800">Phase 2/3: Interactive Task</h1>
+      {/* Header -- single row */}
+      <div className="px-6 py-2.5 border-b border-slate-200/80 bg-white/80 backdrop-blur-sm shrink-0 flex items-center justify-between">
+        <h1 className="text-lg font-semibold text-slate-800 tracking-tight">Phase 2/3: Interactive Task</h1>
         {phase === 'active' && (
           <button
             onClick={handleTaskComplete}
-            className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-500 text-white hover:bg-emerald-600 transition-colors flex items-center gap-1"
+            className="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-500 text-white hover:bg-emerald-600 active:scale-[0.97] transition-all duration-200 ease-out flex items-center gap-1 shadow-sm hover:shadow-md"
           >
             {t('phase2.completeTask')}
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

@@ -159,18 +159,18 @@ export default function Phase1Page() {
   return (
     <div className="flex flex-col h-full">
       {/* DEV: skip buttons */}
-      <div className="fixed bottom-3 left-3 z-50 flex gap-1">
+      <div className="fixed bottom-3 left-3 z-50 flex gap-1.5">
         <button
           onClick={devSkipToPhase2}
-          className="px-2 py-1 text-[10px] bg-red-500 text-white rounded opacity-60 hover:opacity-100"
+          className="px-2 py-1 text-[10px] font-medium bg-red-500 text-white rounded opacity-40 hover:opacity-90 transition-opacity duration-200 ease-out"
         >
-          DEV → P2
+          DEV &rarr; P2
         </button>
         <button
           onClick={devSkipToPhase3}
-          className="px-2 py-1 text-[10px] bg-purple-500 text-white rounded opacity-60 hover:opacity-100"
+          className="px-2 py-1 text-[10px] font-medium bg-purple-500 text-white rounded opacity-40 hover:opacity-90 transition-opacity duration-200 ease-out"
         >
-          DEV → P3
+          DEV &rarr; P3
         </button>
       </div>
       <ComparisonView

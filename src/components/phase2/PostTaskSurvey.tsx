@@ -76,13 +76,13 @@ const IDLE_COLORS = [
 ];
 
 const SELECTED_COLORS = [
-  'bg-red-600 border-red-600 text-white shadow-lg',
-  'bg-red-500 border-red-500 text-white shadow-lg',
-  'bg-red-400 border-red-400 text-white shadow-lg',
-  'bg-slate-500 border-slate-500 text-white shadow-lg',
-  'bg-green-400 border-green-400 text-white shadow-lg',
-  'bg-green-500 border-green-500 text-white shadow-lg',
-  'bg-green-600 border-green-600 text-white shadow-lg',
+  'bg-red-600 border-red-600 text-white shadow-md',
+  'bg-red-500 border-red-500 text-white shadow-md',
+  'bg-red-400 border-red-400 text-white shadow-md',
+  'bg-slate-500 border-slate-500 text-white shadow-md',
+  'bg-green-400 border-green-400 text-white shadow-md',
+  'bg-green-500 border-green-500 text-white shadow-md',
+  'bg-green-600 border-green-600 text-white shadow-md',
 ];
 
 export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
@@ -96,17 +96,17 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
   };
 
   return (
-    <div className="w-full px-16 py-10 overflow-y-auto h-full">
+    <div className="w-full px-16 py-10 overflow-y-auto h-full custom-scrollbar">
       {/* Header */}
       <div className="mb-10">
-        <h2 className="text-[36px] font-bold text-slate-900 mb-3">{t('postTask.title')}</h2>
-        <p className="text-[22px] text-slate-500">
+        <h2 className="text-[36px] font-bold text-slate-900 mb-3 tracking-tight">{t('postTask.title')}</h2>
+        <p className="text-[22px] text-slate-500 leading-relaxed">
           Please rate your agreement with each statement on a 7-point scale.
         </p>
       </div>
 
       {/* Scale legend bar */}
-      <div className="rounded-xl border border-slate-200 bg-gradient-to-r from-red-50 via-slate-50 to-green-50 px-8 py-5 mb-8 flex items-center justify-between">
+      <div className="rounded-xl border border-slate-200/80 bg-gradient-to-r from-red-50 via-slate-50 to-green-50 px-8 py-5 mb-8 flex items-center justify-between shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
         <span className="text-[18px] font-semibold text-red-500">1 = Strongly Disagree</span>
         <div className="flex gap-8">
           {SCALE_LABELS.map((label, i) => (
@@ -126,26 +126,30 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
           return (
             <div
               key={q.id}
-              className={`rounded-2xl border-2 shadow-sm p-8 transition-all duration-300 ${
+              className={`rounded-2xl border-2 p-8 transition-all duration-300 ease-out ${
                 selected !== undefined
-                  ? 'border-blue-300 bg-blue-50/40'
-                  : 'border-slate-200 bg-white'
+                  ? 'border-blue-200/80 bg-blue-50/30 shadow-[0_2px_8px_rgba(59,130,246,0.06)]'
+                  : 'border-slate-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.06)]'
               }`}
             >
               {/* Question text */}
               <div className="flex gap-5 mb-7">
-                <div className="w-12 h-12 rounded-full bg-slate-800 text-white flex items-center justify-center text-[22px] font-bold shrink-0">
+                <div className={`w-12 h-12 rounded-full flex items-center justify-center text-[22px] font-bold shrink-0 transition-all duration-300 ease-out ${
+                  selected !== undefined
+                    ? 'bg-blue-600 text-white shadow-[0_2px_6px_rgba(37,99,235,0.25)]'
+                    : 'bg-slate-800 text-white'
+                }`}>
                   {qIdx + 1}
                 </div>
                 <div className="pt-1">
-                  <h3 className="text-[24px] font-bold text-slate-900">{q.label}</h3>
+                  <h3 className="text-[24px] font-bold text-slate-900 tracking-tight">{q.label}</h3>
                   <p className="text-[19px] text-slate-500 mt-2 leading-relaxed">{q.desc}</p>
                 </div>
               </div>
 
               {/* 7-point Likert scale */}
               <div className="flex items-center px-6">
-                <span className="text-[18px] font-medium text-slate-500 w-32 text-right pr-6 shrink-0 leading-snug">
+                <span className="text-[18px] font-medium text-slate-400 w-32 text-right pr-6 shrink-0 leading-snug">
                   Strongly<br />Disagree
                 </span>
 
@@ -163,11 +167,11 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
                         onClick={() => handleSelect(q.id, value)}
                         title={label}
                         className={`
-                          ${sizeClass} rounded-full border-[3px] transition-all duration-200
-                          flex items-center justify-center text-[19px] font-bold cursor-pointer
+                          ${sizeClass} rounded-full border-[3px] flex items-center justify-center text-[19px] font-bold cursor-pointer
+                          transition-all duration-200 ease-out
                           ${isSelected
-                            ? `${SELECTED_COLORS[i]} scale-110`
-                            : `${IDLE_COLORS[i]} text-slate-400`
+                            ? `${SELECTED_COLORS[i]} likert-select`
+                            : `${IDLE_COLORS[i]} text-slate-400 hover:scale-105 hover:shadow-sm active:scale-95`
                           }
                         `}
                       >
@@ -177,7 +181,7 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
                   })}
                 </div>
 
-                <span className="text-[18px] font-medium text-slate-500 w-32 pl-6 shrink-0 leading-snug">
+                <span className="text-[18px] font-medium text-slate-400 w-32 pl-6 shrink-0 leading-snug">
                   Strongly<br />Agree
                 </span>
               </div>
@@ -192,10 +196,10 @@ export default function PostTaskSurvey({ onSubmit }: PostTaskSurveyProps) {
           onClick={() => onSubmit(responses)}
           disabled={!allAnswered}
           className={`
-            w-full py-5 rounded-2xl text-[22px] font-bold transition-all duration-300
+            w-full py-5 rounded-2xl text-[22px] font-bold transition-all duration-300 ease-out
             ${allAnswered
-              ? 'bg-slate-800 text-white hover:bg-slate-900 shadow-lg'
-              : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+              ? 'bg-slate-800 text-white hover:bg-slate-900 active:scale-[0.99] shadow-[0_2px_8px_rgba(15,23,42,0.2)] hover:shadow-[0_4px_12px_rgba(15,23,42,0.25)]'
+              : 'bg-slate-100 text-slate-400 cursor-not-allowed border border-slate-200'
             }
           `}
         >

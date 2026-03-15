@@ -57,13 +57,13 @@ export default function TaskWrapper({ systemUrl, onComplete }: TaskWrapperProps)
                 <div className="flex gap-3 justify-center">
                   <button
                     onClick={handleRetry}
-                    className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 rounded-md transition-colors"
+                    className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white hover:bg-blue-700 rounded-lg transition-colors"
                   >
                     {t('phase2.retry')}
                   </button>
                   <button
                     onClick={onComplete}
-                    className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors"
+                    className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
                   >
                     {t('phase2.skip')}
                   </button>

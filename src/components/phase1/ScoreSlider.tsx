@@ -16,22 +16,23 @@ export default function ScoreSlider({ value, onChange, min = 0, max = 100 }: Sco
     <div className="relative pt-6 pb-1">
       {/* Floating value bubble */}
       <div
-        className="absolute top-0 pointer-events-none transition-opacity duration-150"
+        className="absolute top-0 pointer-events-none"
         style={{
           left: `calc(${pct}% - 16px + ${(50 - pct) * 0.22}px)`,
-          opacity: isDragging ? 1 : 0.85,
+          opacity: isDragging ? 1 : 0.8,
+          transition: 'opacity 0.2s cubic-bezier(0.22, 1, 0.36, 1)',
         }}
       >
         <div className={`
           px-1.5 py-0.5 rounded text-[10px] font-semibold text-white tabular-nums text-center min-w-[32px]
-          transition-all duration-150
-          ${isDragging ? 'bg-blue-600 scale-110' : 'bg-slate-400'}
+          transition-all duration-200 ease-out
+          ${isDragging ? 'bg-blue-600 scale-110 shadow-sm' : 'bg-slate-400'}
         `}>
           {value}
         </div>
         {/* Arrow */}
         <div
-          className={`w-0 h-0 mx-auto border-l-[4px] border-r-[4px] border-t-[4px] border-l-transparent border-r-transparent transition-colors duration-150 ${isDragging ? 'border-t-blue-600' : 'border-t-slate-400'}`}
+          className={`w-0 h-0 mx-auto border-l-[4px] border-r-[4px] border-t-[4px] border-l-transparent border-r-transparent transition-colors duration-200 ease-out ${isDragging ? 'border-t-blue-600' : 'border-t-slate-400'}`}
         />
       </div>
 
@@ -57,9 +58,9 @@ export default function ScoreSlider({ value, onChange, min = 0, max = 100 }: Sco
       </div>
 
       {/* Min/Max endpoint labels */}
-      <div className="flex justify-between mt-0.5">
-        <span className="text-[10px] text-slate-400 tabular-nums">{min}</span>
-        <span className="text-[10px] text-slate-400 tabular-nums">{max}</span>
+      <div className="flex justify-between mt-1">
+        <span className="text-[10px] text-slate-400 tabular-nums font-medium">{min}</span>
+        <span className="text-[10px] text-slate-400 tabular-nums font-medium">{max}</span>
       </div>
     </div>
   );
