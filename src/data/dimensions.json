@@ -1,0 +1,40 @@
+{
+  "dimensions": [
+    {
+      "id": "dim_1",
+      "name_en": "Dimension 1",
+      "name_zh": "维度 1",
+      "description_en": "TBD",
+      "description_zh": "待定",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "id": "dim_2",
+      "name_en": "Dimension 2",
+      "name_zh": "维度 2",
+      "description_en": "TBD",
+      "description_zh": "待定",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "id": "dim_3",
+      "name_en": "Dimension 3",
+      "name_zh": "维度 3",
+      "description_en": "TBD",
+      "description_zh": "待定",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "id": "dim_4",
+      "name_en": "Dimension 4",
+      "name_zh": "维度 4",
+      "description_en": "TBD",
+      "description_zh": "待定",
+      "min": 0,
+      "max": 100
+    }
+  ]
+}

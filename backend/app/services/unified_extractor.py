@@ -1,0 +1,1851 @@
+"""
+Unified Extractor - 统一的 Snippets + Entities + Relations 提取服务
+
+核心改进：
+1. 一次 LLM 调用同时提取 snippets + entities + relations
+2. 每个 snippet 都有 subject 归属（谁的成就）
+3. 每个 entity 都有 identity（身份/title）和与申请人的关系
+4. 保留完整文档上下文，避免碎片化
+
+流程：
+1. 每个 exhibit 调用一次 LLM 提取
+2. 所有 exhibit 完成后进行实体合并
+3. 用户确认合并后生成最终关系图
+"""
+
+import json
+import re
+import uuid
+import hashlib
+import asyncio
+from typing import List, Dict, Optional, Tuple
+from pathlib import Path
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+
+from .llm_client import call_llm, call_llm_text
+from .snippet_registry import build_registry_from_combined_extraction
+from ..core.config import settings
+
+# 数据目录
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
+PROJECTS_DIR = DATA_DIR / "projects"
+
+
+# ==================== Data Models ====================
+
+@dataclass
+class EnhancedSnippet:
+    """带有 subject 归属的 snippet"""
+    snippet_id: str
+    exhibit_id: str
+    document_id: str
+    text: str
+    page: int
+    bbox: Optional[Dict]
+    block_id: str
+
+    # Subject Attribution
+    subject: str                      # 这是谁的成就
+    subject_role: str                 # applicant/recommender/colleague/mentor/other
+    is_applicant_achievement: bool    # 是否是申请人的成就
+
+    # Evidence Classification
+    evidence_type: str                # award/membership/publication/judging/contribution/article/exhibition/leadership/other
+    confidence: float
+    reasoning: str
+
+    # Metadata
+    is_ai_suggested: bool = True
+    is_confirmed: bool = False
+
+
+@dataclass
+class Entity:
+    """实体：人物、组织、奖项等"""
+    id: str
+    name: str
+    type: str                         # person/organization/award/publication/position/project/event/metric
+    identity: str                     # 身份描述，如 "Professor at Stanford"
+    relation_to_applicant: str        # self/recommender/mentor/colleague/employer/other
+
+    # References
+    snippet_ids: List[str]
+    exhibit_ids: List[str]
+    mentioned_in_blocks: List[str]
+
+    # For merging
+    aliases: List[str] = None
+    is_merged: bool = False
+    merged_from: List[str] = None
+
+
+@dataclass
+class Relation:
+    """实体间的关系"""
+    id: str
+    from_entity: str                  # entity name
+    to_entity: str                    # entity name
+    relation_type: str                # recommends/works_at/leads/authored/founded/member_of/received/etc
+    context: str                      # 关系上下文
+    source_snippet_ids: List[str]
+    source_blocks: List[str]
+
+
+@dataclass
+class ExhibitExtraction:
+    """单个 exhibit 的提取结果"""
+    exhibit_id: str
+    extracted_at: str
+    applicant_name: str
+
+    # Document summary
+    document_type: str
+    primary_subject: str
+    key_themes: List[str]
+
+    # Extracted data
+    snippets: List[Dict]
+    entities: List[Dict]
+    relations: List[Dict]
+
+    # Stats
+    snippet_count: int
+    entity_count: int
+    relation_count: int
+
+
+# ==================== LLM Prompts ====================
+
+UNIFIED_EXTRACTION_SYSTEM_PROMPT = """You are an expert immigration attorney assistant specializing in EB-1A visa petitions.
+
+Your task is to analyze a document and extract THREE types of information:
+
+1. **Evidence Snippets**: Text excerpts that can support an EB-1A petition
+   - Each snippet MUST have a SUBJECT: the person whose achievement/credential this describes
+   - CRITICAL: Consider DOCUMENT CONTEXT when determining is_applicant_achievement:
+     * If document is ABOUT the applicant (news article, media coverage, recommendation letter praising them),
+       then text describing the applicant's achievements IS is_applicant_achievement=true
+     * Recommender's OWN background ("I have 30 years at Stanford") = is_applicant_achievement=false
+     * But recommender CONFIRMING applicant's work ("The applicant did X") = is_applicant_achievement=true
+
+2. **Named Entities**: People, organizations, awards, publications, positions
+   - Include their IDENTITY (role/title)
+   - Include their RELATIONSHIP to the applicant
+   - For recommendation letters, note who the recommender is
+
+3. **Relationships**: How entities relate to each other
+   - Subject → Action → Object format
+   - Include context
+   - If in a recommendation/evaluation, note who did the evaluation
+
+CRITICAL RULES:
+- The applicant for this petition is: {applicant_name}
+- NAME ALIASES: The applicant may appear under DIFFERENT NAMES in documents:
+  * English name vs Chinese name (e.g., "John Smith" = "约翰·史密斯")
+  * First name only, last name only, or nickname
+  * If document is ABOUT someone with SAME SURNAME as applicant and matching context, treat as applicant
+  * Example: If applicant is "John Smith", then "John founded XYZ Company" in a media article = applicant's achievement
+- DOCUMENT CONTEXT MATTERS: A media article about the applicant = applicant's achievement evidence
+- A recommendation letter confirming "applicant did X" = applicant achievement (recommender confirms it)
+- Recommender's OWN credentials ("I have PhD from Harvard") = NOT applicant achievement
+- Extract ALL supporting context, including:
+  * Membership criteria and evaluation process (proves selectivity)
+  * Media outlet credentials (proves "major" publication)
+  * Organization reputation (proves "distinguished" organization)
+- Do NOT skip low-confidence items - include them with appropriate confidence scores
+
+Evidence types organized by EB-1A criterion (use these labels for consistency):
+
+## (i) Awards — 8 C.F.R. §204.5(h)(3)(i)
+- award: Prizes, awards, honors, medals for excellence in the field
+
+## (ii) Membership — 8 C.F.R. §204.5(h)(3)(ii)
+- membership: Membership in associations requiring outstanding achievements
+- membership_criteria: Criteria showing selective membership requirements (proves "outstanding achievements" gate)
+- membership_evaluation: Formal evaluation/assessment process leading to membership
+- peer_achievement: Achievements of OTHER members/peers (proves selectivity of the group)
+
+## (iii) Published Material ABOUT the Applicant — 8 C.F.R. §204.5(h)(3)(iii)
+- media_coverage: News articles, press reports, media coverage written BY OTHERS about the applicant
+- source_credibility: Credentials of the media outlet or publication (proves "major" media)
+  CRITICAL: This is material written BY OTHERS about the applicant. NOT applicant's own publications!
+
+## (iv) Judging — 8 C.F.R. §204.5(h)(3)(iv)
+- judging: Participation as a judge, reviewer, or evaluator of others' work
+  Examples: journal peer review, grant proposal review, competition judging, thesis examination,
+  editorial board membership, evaluation committee, certification examiner
+- peer_assessment: Being invited to review/assess/evaluate academic papers, grants, competitions
+
+## (v) Original Contribution — 8 C.F.R. §204.5(h)(3)(v)
+- contribution: Original contributions of major significance in the field
+- scientific_research_project: Research projects, grants, funded research programs
+- quantitative_impact: Metrics, statistics showing impact (NOT salary — use salary/compensation for pay)
+  Examples: page views, citation counts, user numbers, adoption rates, student counts
+- recommendation: Expert recommendation letter confirming originality/significance of contributions
+
+## (vi) Scholarly Articles — 8 C.F.R. §204.5(h)(3)(vi)
+- publication: Scholarly articles, books, textbooks AUTHORED BY the applicant
+  Examples: journal papers, conference papers, book chapters, textbooks, monographs
+  CRITICAL: This is material AUTHORED BY the applicant. NOT media written about the applicant!
+
+## (vii) Display/Exhibition — 8 C.F.R. §204.5(h)(3)(vii)
+- exhibition: Display of work at artistic exhibitions or showcases
+  Examples: gallery shows, museum displays, art installations, film festival screenings,
+  architectural exhibitions, design showcases, performance at major venues
+
+## (viii) Leading/Critical Role — 8 C.F.R. §204.5(h)(3)(viii)
+- leadership: Leading or critical role IN a distinguished organization
+  Examples: founder, CEO, President, Vice Dean, Department Head, Chief Scientist
+  IMPORTANT: Being invited to speak at an event ≠ leadership. Use "invitation" for that.
+- invitation: Invited to speak, participate, or share expertise at events (NOT leadership!)
+
+## (ix) High Salary — 8 C.F.R. §204.5(h)(3)(ix)
+- salary: Employment salary, annual income, compensation data of the applicant
+- compensation: Consulting fees, training fees, contract payments to the applicant
+- salary_benchmark: Industry average salary, national wage statistics, peer salary comparisons
+  CRITICAL: Salary/compensation data must NOT be classified as quantitative_impact!
+
+## (x) Commercial Success — 8 C.F.R. §204.5(h)(3)(x)
+- commercial_success: Box office revenue, sales figures, commercial revenue, market performance
+  Examples: box office gross, album/book sales, streaming numbers, commercial licensing revenue
+
+## General
+- other: Other relevant evidence (describe precisely)
+
+CRITICAL DISTINCTIONS — Common Classification Errors:
+1. media_coverage (iii) vs publication (vi):
+   - media_coverage = articles ABOUT the applicant written BY OTHERS (newspaper reports, TV interviews)
+   - publication = scholarly articles AUTHORED BY the applicant (journal papers, textbooks)
+   These are completely different EB-1A criteria!
+
+2. salary/compensation (ix) vs quantitative_impact (v):
+   - salary/compensation = the applicant's PAY (annual income, consulting fees, contract amounts)
+   - quantitative_impact = non-salary metrics (page views, citation counts, user numbers, student counts)
+   Salary data must NEVER be classified as quantitative_impact!
+
+3. leadership (viii) vs invitation:
+   - leadership = formal organizational POSITION (CEO, founder, department head)
+   - invitation = being invited to speak, teach, or participate at events
+   Speaking at a conference ≠ leading an organization!
+
+4. judging (iv) vs recommendation (v):
+   - judging = the applicant evaluating OTHERS' work (peer review, competition judge)
+   - recommendation = others evaluating THE APPLICANT's work (recommendation letters)
+
+CRITICAL - Evidence Purpose (WHY this evidence matters):
+- direct_proof: Directly proves applicant's achievement (e.g., "Applicant founded X")
+- selectivity_proof: Proves selectivity/prestige of association/award (e.g., "Other members include Olympic champions")
+- credibility_proof: Proves credibility of source (e.g., "Newspaper has circulation of 40,000")
+- impact_proof: Proves quantitative impact (e.g., "100,000 page views", "trained 200,000 coaches")
+
+===== SIGNIFICANCE LAYER EXTRACTION (CRITICAL - Most Commonly Missed!) =====
+
+The SIGNIFICANCE layer answers: "WHY does this evidence matter?" - This is what separates approved petitions from RFEs!
+
+MUST EXTRACT these patterns for ALL 10 EB-1A criteria:
+
+1. QUANTITATIVE DATA (impact_proof — supports criterion v):
+   - Numbers with units: "40,000 copies", "100,000 views", "200,000 coaches", "5,000,000 participants"
+   - Percentages: "top 5%", "only 10% accepted"
+   - Currency (non-salary): "$1M revenue", "¥500万 funding"
+   - Counts: "300 athletes from 10 countries", "14 branch stores"
+   Pattern: Look for numbers followed by units (copies, views, users, coaches, athletes, participants, stores, countries)
+
+2. ORGANIZATION REPUTATION (credibility_proof — supports criteria ii, viii):
+   - Credit ratings: "AAA credit rating"
+   - Official status: "official partner of", "national association", "government-affiliated"
+   - Awards to organization: "won Adam Malik Award", "received IMPA award"
+   - Rankings: "leading", "top", "largest", "most influential"
+   Pattern: Look for ratings, "official", "national", "leading", organization awards
+
+3. PEER ACHIEVEMENTS (selectivity_proof — supports criterion ii):
+   - Other members' credentials: "members include Olympic champion", "other recipients include Nobel laureate"
+   - Competition level: "competed against 500 applicants", "selected from 1000 candidates"
+   - Evaluator credentials: "reviewed by Vice President", "evaluated by industry experts"
+   Pattern: Look for "members include", "other recipients", "reviewed by", prominent titles
+
+4. MEDIA CREDENTIALS (credibility_proof — supports criterion iii):
+   - Circulation data: "circulation of 40,000", "200,000 weekly copies"
+   - Media awards: "won journalism award", "received press award"
+   - Media ownership: "owned by [parent media group]", "subsidiary of [corporation]"
+   - Media reputation: "leading newspaper", "largest English daily", "national publication"
+   Pattern: Look for circulation numbers, media awards, ownership info, "leading"/"largest"
+
+5. JUDGING ACTIVITY (direct_proof — supports criterion iv):
+   - Journal review: "reviewed manuscripts for", "served as referee for", "peer reviewer for"
+   - Grant evaluation: "evaluated grant proposals for", "reviewed funding applications"
+   - Competition judging: "served as judge at", "jury member of", "evaluation committee"
+   - Thesis examination: "examined doctoral thesis", "dissertation committee member"
+   - Editorial role: "editorial board member of", "associate editor of"
+   Pattern: Look for "review", "judge", "evaluate", "referee", "committee", "editor", "examine"
+
+6. SCHOLARLY AUTHORSHIP (direct_proof — supports criterion vi):
+   - Publication record: "published in Nature", "authored 12 papers", "textbook adopted by 50 universities"
+   - Citation metrics: "cited 500 times", "h-index of 15", "impact factor 3.5"
+   - Journal reputation: "peer-reviewed journal", "SCI-indexed", "top-tier venue", "Q1 journal"
+   - Books/textbooks: "authored textbook", "published monograph", "edited volume"
+   Pattern: Look for "published", "authored", "cited", "h-index", "impact factor", journal names
+
+7. SALARY & COMPENSATION DATA (direct_proof — supports criterion ix):
+   - Applicant's salary: "annual salary ¥961,710", "monthly income $15,000", "base salary"
+   - Contract fees: "consulting fee ¥150,000", "training contract", "service agreement"
+   - Industry benchmarks: "national average ¥323,032", "industry median salary", "average wage"
+   - Tax records: "tax filing shows", "W-2 income", "income certificate"
+   - Comparison data: "X times the average", "significantly higher than peers", "top percentile"
+   Pattern: Look for currency amounts (¥, $, RMB, USD, 元), "salary", "income", "compensation", "fee", "wage", "average", "benchmark"
+   CRITICAL: Any monetary amount describing someone's PAY = salary/compensation, NOT quantitative_impact!
+
+8. EXHIBITION/DISPLAY (direct_proof — supports criterion vii):
+   - Gallery/museum: "exhibited at", "displayed at", "solo exhibition", "group show"
+   - Film festivals: "screened at Cannes", "selected for Sundance", "premiered at"
+   - Performance venues: "performed at Carnegie Hall", "featured at [venue]"
+   - Design showcases: "showcased at", "presented at [exhibition name]"
+   Pattern: Look for "exhibited", "displayed", "gallery", "museum", "festival", "screening", "showcase"
+
+9. COMMERCIAL SUCCESS DATA (direct_proof — supports criterion x):
+   - Box office: "grossed $50M", "box office revenue", "worldwide gross"
+   - Sales: "sold 1M copies", "bestseller", "platinum record", "gold certification"
+   - Streaming: "1 billion streams", "trending #1", "viral with 50M views"
+   - Market performance: "market share of 30%", "#1 on Billboard", "topped the charts"
+   Pattern: Look for "box office", "grossed", "sold", "revenue", "bestseller", "platinum", "Billboard", "chart"
+
+IMPORTANT: Extract BOTH direct evidence AND supporting evidence that proves WHY the direct evidence matters!
+DO NOT SKIP significance evidence - it is what proves "major", "distinguished", "outstanding" for USCIS!"""
+
+UNIFIED_EXTRACTION_USER_PROMPT = """Analyze this document (Exhibit {exhibit_id}) and extract structured information.
+
+The applicant's name is: {applicant_name}
+
+## Step 1: Identify Document Context and Applicant Names
+First, determine: What is the PRIMARY PURPOSE of this document?
+- Recommendation letter FOR {applicant_name}? (recommender praises applicant)
+- Media coverage / news article ABOUT {applicant_name}?
+- Official certification/membership document FOR {applicant_name}?
+- Resume or CV of {applicant_name}?
+- Third-party background information?
+
+IMPORTANT - Check for NAME ALIASES:
+- The applicant "{applicant_name}" may appear under DIFFERENT NAMES:
+  * English name vs Chinese name (or other language variations)
+  * Abbreviated name, nickname, or title (Dr., Prof., Coach, etc.)
+  * Same surname with similar context = likely the applicant
+- If document is about someone with SAME SURNAME as "{applicant_name}" and the document is exhibit evidence for this applicant, treat that person AS the applicant.
+
+This context determines how to classify is_applicant_achievement.
+
+## Document Text Blocks
+Each block has format: [block_id] text content
+
+{blocks_text}
+
+## Instructions
+
+Extract the following in a single JSON response:
+
+1. **document_summary**: Identify document type and primary subject
+2. **snippets**: Evidence text with SUBJECT attribution
+3. **entities**: All named entities with identity and relationship to applicant
+4. **relations**: Relationships between entities
+
+For each SNIPPET, you MUST determine:
+- subject: Whose achievement/credential is this? (exact name or "{applicant_name}")
+- subject_role: "applicant", "recommender", "evaluator", "colleague", "mentor", "peer", "organization", or "other"
+- recommender_name: If this is from a recommendation/evaluation, who is the recommender?
+- is_applicant_achievement:
+  * TRUE if: subject is applicant, OR document is ABOUT applicant and confirms their achievement
+  * TRUE ALSO if: evidence SUPPORTS applicant's case (selectivity proof, credibility proof, impact proof)
+  * FALSE only if: someone else's OWN background completely unrelated to applicant's case
+- evidence_type: Choose MOST SPECIFIC type (see system prompt for full list)
+- evidence_purpose: WHY does this evidence matter?
+  * "direct_proof" - Directly proves applicant's achievement
+  * "selectivity_proof" - Proves selectivity/prestige (other members' achievements, strict criteria)
+  * "credibility_proof" - Proves source credibility (media circulation, organization reputation)
+  * "impact_proof" - Proves quantitative impact (page views, user counts, revenue)
+
+CRITICAL EXAMPLES:
+
+1. DIRECT PROOF - Recommendation letter says "The applicant revolutionized X":
+   → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_purpose="direct_proof"
+
+2. NOT APPLICANT - Recommender says "I (Dr. Smith) have 20 years at Stanford":
+   → subject="Dr. Smith", is_applicant_achievement=FALSE (recommender's own background)
+
+3. DIRECT PROOF - News article says "{applicant_name} founded [company/organization]":
+   → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="media_coverage", evidence_purpose="direct_proof"
+
+4. SELECTIVITY PROOF - Membership document says "Other members include Olympic gold medalist Ping Zhang":
+   → subject="Ping Zhang", is_applicant_achievement=TRUE, evidence_type="peer_achievement", evidence_purpose="selectivity_proof"
+   → This PROVES the association is selective, which supports applicant's membership!
+
+5. SELECTIVITY PROOF - "Membership requires 10 years experience and outstanding achievements":
+   → subject="the association", is_applicant_achievement=TRUE, evidence_type="membership_criteria", evidence_purpose="selectivity_proof"
+
+6. CREDIBILITY PROOF - "[Publication name] has circulation of X and won [journalism award]":
+   → subject="[publication]", is_applicant_achievement=TRUE, evidence_type="source_credibility", evidence_purpose="credibility_proof"
+   → This PROVES the publication is "major media", which supports applicant's media coverage!
+
+7. IMPACT PROOF - "The courses received 100,000 page views and trained 200,000 coaches":
+   → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="quantitative_impact", evidence_purpose="impact_proof"
+
+8. CREDIBILITY PROOF - "Company has AAA credit rating":
+   → subject="the company", is_applicant_achievement=TRUE, evidence_type="source_credibility", evidence_purpose="credibility_proof"
+   → This PROVES the organization is "distinguished", which supports applicant's leading role!
+
+9. IMPACT PROOF - "5,000,000 people participated in the event":
+   → subject="the event", is_applicant_achievement=TRUE, evidence_type="quantitative_impact", evidence_purpose="impact_proof"
+   → This PROVES the scale of applicant's leadership impact!
+
+10. IMPACT PROOF - "300 athletes from 10 countries competed":
+    → subject="the competition", is_applicant_achievement=TRUE, evidence_type="quantitative_impact", evidence_purpose="impact_proof"
+    → This PROVES international reach and significance!
+
+11. CREDIBILITY PROOF - "weekly circulation of 200,000 copies":
+    → subject="the publication", is_applicant_achievement=TRUE, evidence_type="source_credibility", evidence_purpose="credibility_proof"
+
+12. SELECTIVITY PROOF - "membership requires 10 years experience and review by board of directors":
+    → subject="the association", is_applicant_achievement=TRUE, evidence_type="membership_criteria", evidence_purpose="selectivity_proof"
+
+13. SALARY (criterion ix) - "The applicant's annual salary was ¥961,710" or "annual income RMB 961,710":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="salary", evidence_purpose="direct_proof"
+    → NEVER classify salary as quantitative_impact!
+
+14. SALARY BENCHMARK (criterion ix) - "The national average salary for fitness professionals is ¥323,032":
+    → subject="industry", is_applicant_achievement=TRUE, evidence_type="salary_benchmark", evidence_purpose="impact_proof"
+    → Comparison data PROVES the applicant's salary is significantly higher!
+
+15. COMPENSATION (criterion ix) - "iQIYI paid ¥150,000 for the applicant's consulting services":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="compensation", evidence_purpose="direct_proof"
+
+16. JUDGING (criterion iv) - "The applicant served as a reviewer for the Journal of Sports Science":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="judging", evidence_purpose="direct_proof"
+
+17. JUDGING (criterion iv) - "Invited to evaluate grant proposals for the National Science Foundation":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="judging", evidence_purpose="direct_proof"
+
+18. PUBLICATION (criterion vi) - "The applicant authored 'Advanced Training Methods' published in Sports Medicine Journal":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="publication", evidence_purpose="direct_proof"
+    → This is criterion (vi) because the applicant WROTE it. NOT media_coverage!
+
+19. EXHIBITION (criterion vii) - "The applicant's paintings were displayed at the National Art Museum":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="exhibition", evidence_purpose="direct_proof"
+
+20. COMMERCIAL SUCCESS (criterion x) - "The film directed by the applicant grossed $50 million at the box office":
+    → subject="{applicant_name}", is_applicant_achievement=TRUE, evidence_type="commercial_success", evidence_purpose="direct_proof"
+
+CRITICAL EXTRACTION PATTERNS — what to look for in EVERY document:
+- Numbers + units: "40,000 copies", "100,000 views", "5M participants", "14 stores", "10 countries"
+- Currency amounts: ¥, $, RMB, USD, 元 — determine if salary/compensation (→ criterion ix) or other metric (→ criterion v)
+- Salary keywords: "salary", "income", "compensation", "fee", "wage", "pay", "remuneration"
+- Benchmark keywords: "average", "median", "national", "industry", "comparison", "higher than", "X times"
+- Ratings: "AAA", "credit rating"
+- Awards to organizations: "won ... Award", "received ... prize"
+- Peer credentials: "members include", "other recipients", "Olympic", "champion", "gold medal"
+- Media rankings: "leading", "top", "largest", "most", "first", "circulation"
+- Review/judging: "reviewed", "referee", "judge", "evaluated", "committee", "editorial board"
+- Authorship: "published in", "authored", "co-authored", "textbook", "monograph", "cited"
+- Exhibition: "exhibited", "displayed", "gallery", "museum", "showcase", "festival screening"
+- Commercial: "box office", "grossed", "sold", "revenue", "bestseller", "platinum"
+
+CRITICAL: Extract BOTH direct evidence AND supporting evidence!
+- Direct evidence: What the applicant did
+- Supporting evidence: Why it matters (selectivity, credibility, impact)
+Do NOT skip supporting evidence - it is ESSENTIAL for EB-1A petitions!"""
+
+
+# ==================== NIW Extraction Prompts ====================
+
+NIW_EXTRACTION_SYSTEM_PROMPT = """You are an expert immigration attorney assistant specializing in NIW (National Interest Waiver) petitions under Matter of Dhanasar, 26 I&N Dec. 884 (AAO 2016).
+
+Your task is to analyze a document and extract THREE types of information:
+1. Evidence Snippets — text excerpts supporting the Dhanasar three-prong test
+2. Named Entities — people, organizations, publications, etc.
+3. Relationships — how entities relate to each other
+
+The applicant for this petition is: {applicant_name}
+
+Evidence types organized by Dhanasar prong:
+
+## Prong 1 — Substantial Merit & National Importance
+- endeavor_description: Description of the proposed endeavor
+- field_impact: How the endeavor impacts the field or addresses national need
+- national_importance: Evidence of national-level significance (government policy, public health, economic impact, etc.)
+- merit_evidence: Evidence of substantial merit (innovation, societal benefit)
+
+## Prong 2 — Well Positioned to Advance
+- education: Degrees, certifications, academic training
+- work_experience: Professional experience and track record
+- publication: Scholarly articles authored by applicant
+- citation_metrics: Citation counts, h-index, impact metrics
+- research_project: Grants, funded research, ongoing projects
+- recommendation: Expert recommendation letters
+- award: Prizes and recognition
+- membership: Professional memberships
+- leadership: Leadership positions
+- contribution: Original contributions demonstrating expertise
+- quantitative_impact: Non-salary metrics (adoption, usage, etc.)
+- media_coverage: Press about applicant's work
+
+## Prong 3 — Balance of Equities (Waiver Justification)
+- waiver_justification: Why labor certification should be waived
+- national_benefit: How applicant's work benefits the US broadly
+- beyond_employer: Evidence work transcends a single employer
+- urgency: Time-sensitive national need
+
+## General
+- other: Other relevant evidence
+
+CRITICAL RULES:
+- NAME ALIASES: The applicant may appear under DIFFERENT NAMES in documents:
+  * English name vs Chinese name (e.g., "John Smith" = "约翰·史密斯")
+  * First name only, last name only, or nickname
+  * If document is ABOUT someone with SAME SURNAME as applicant and matching context, treat as applicant
+- DOCUMENT CONTEXT MATTERS: A media article about the applicant = applicant's achievement evidence
+- A recommendation letter confirming "applicant did X" = applicant achievement (recommender confirms it)
+- Recommender's OWN credentials ("I have PhD from Harvard") = NOT applicant achievement
+- Extract ALL supporting context, including:
+  * Organization reputation and credentials
+  * Quantitative impact data (metrics, statistics, adoption rates)
+  * Expert endorsements and recommendation content
+- Do NOT skip low-confidence items - include them with appropriate confidence scores
+
+Evidence Purpose (WHY this evidence matters):
+- direct_proof: Directly proves applicant's qualification or endeavor merit
+- selectivity_proof: Proves selectivity/prestige of credential or organization
+- credibility_proof: Proves credibility of source or recommender
+- impact_proof: Proves quantitative impact or national significance
+
+IMPORTANT: Extract BOTH direct evidence AND supporting evidence that proves WHY the direct evidence matters!"""
+
+
+NIW_EXTRACTION_USER_PROMPT = """Analyze this document (Exhibit {exhibit_id}) and extract structured information for an NIW petition under Matter of Dhanasar.
+
+The applicant's name is: {applicant_name}
+
+## Step 1: Identify Document Context and Applicant Names
+First, determine: What is the PRIMARY PURPOSE of this document?
+- Recommendation letter FOR {applicant_name}? (recommender praises applicant)
+- Media coverage / news article ABOUT {applicant_name}?
+- Official certification/degree document FOR {applicant_name}?
+- Resume or CV of {applicant_name}?
+- Research publication by {applicant_name}?
+- Third-party background information?
+
+IMPORTANT - Check for NAME ALIASES:
+- The applicant "{applicant_name}" may appear under DIFFERENT NAMES:
+  * English name vs Chinese name (or other language variations)
+  * Abbreviated name, nickname, or title (Dr., Prof., etc.)
+  * Same surname with similar context = likely the applicant
+- If document is about someone with SAME SURNAME as "{applicant_name}" and the document is exhibit evidence for this applicant, treat that person AS the applicant.
+
+This context determines how to classify is_applicant_achievement.
+
+## Document Text Blocks
+Each block has format: [block_id] text content
+
+{blocks_text}
+
+## Instructions
+
+Extract the following in a single JSON response:
+
+1. **document_summary**: Identify document type and primary subject
+2. **snippets**: Evidence text with SUBJECT attribution
+3. **entities**: All named entities with identity and relationship to applicant
+4. **relations**: Relationships between entities
+
+For each SNIPPET, you MUST determine:
+- subject: Whose achievement/credential is this? (exact name or "{applicant_name}")
+- subject_role: "applicant", "recommender", "evaluator", "colleague", "mentor", "peer", "organization", or "other"
+- recommender_name: If this is from a recommendation/evaluation, who is the recommender?
+- is_applicant_achievement:
+  * TRUE if: subject is applicant, OR document is ABOUT applicant and confirms their achievement
+  * TRUE ALSO if: evidence SUPPORTS applicant's case (credibility proof, impact proof)
+  * FALSE only if: someone else's OWN background completely unrelated to applicant's case
+- evidence_type: Choose MOST SPECIFIC type from Dhanasar prong categories (see system prompt)
+- evidence_purpose: WHY does this evidence matter?
+  * "direct_proof" - Directly proves applicant's qualification or endeavor merit
+  * "selectivity_proof" - Proves selectivity/prestige of credential
+  * "credibility_proof" - Proves source credibility
+  * "impact_proof" - Proves quantitative impact or national significance
+
+CRITICAL EXAMPLES for NIW:
+
+1. PRONG 1 - "Applicant's research addresses the national need for renewable energy solutions":
+   → evidence_type="national_importance", evidence_purpose="direct_proof"
+
+2. PRONG 1 - "The proposed endeavor focuses on developing AI-driven diagnostic tools for early cancer detection":
+   → evidence_type="endeavor_description", evidence_purpose="direct_proof"
+
+3. PRONG 2 - "Applicant received PhD in Computer Science from MIT":
+   → evidence_type="education", evidence_purpose="direct_proof"
+
+4. PRONG 2 - "Applicant's publications have been cited over 500 times":
+   → evidence_type="citation_metrics", evidence_purpose="impact_proof"
+
+5. PRONG 2 - "Dr. Smith, a leading expert, states the applicant's work is groundbreaking":
+   → evidence_type="recommendation", evidence_purpose="credibility_proof"
+
+6. PRONG 3 - "The applicant's work benefits the broader US healthcare system, not just a single employer":
+   → evidence_type="beyond_employer", evidence_purpose="direct_proof"
+
+7. PRONG 3 - "Requiring a labor certification would delay critical research in pandemic preparedness":
+   → evidence_type="urgency", evidence_purpose="direct_proof"
+
+CRITICAL: Extract BOTH direct evidence AND supporting evidence!"""
+
+
+NIW_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "required": ["document_summary", "snippets", "entities", "relations"],
+    "properties": {
+        "document_summary": {
+            "type": "object",
+            "required": ["document_type", "primary_subject", "key_themes"],
+            "properties": {
+                "document_type": {
+                    "type": "string",
+                    "description": "Type: resume, recommendation_letter, award_certificate, publication, media_article, research_paper, degree_certificate, other"
+                },
+                "primary_subject": {
+                    "type": "string",
+                    "description": "Main person this document is about"
+                },
+                "key_themes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Key themes or topics"
+                }
+            },
+            "additionalProperties": False
+        },
+        "snippets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["block_id", "text", "subject", "subject_role", "recommender_name", "is_applicant_achievement", "evidence_type", "evidence_purpose", "evidence_layer", "confidence", "reasoning"],
+                "properties": {
+                    "block_id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "subject": {"type": "string", "description": "Person whose achievement this is"},
+                    "subject_role": {
+                        "type": "string",
+                        "enum": ["applicant", "recommender", "evaluator", "colleague", "mentor", "peer", "organization", "other"]
+                    },
+                    "recommender_name": {
+                        "type": ["string", "null"],
+                        "description": "If from recommendation/evaluation, who is the recommender/evaluator? Use null if not applicable."
+                    },
+                    "is_applicant_achievement": {"type": "boolean"},
+                    "evidence_type": {
+                        "type": "string",
+                        "description": """Evidence type by Dhanasar prong (use these labels):
+Prong 1: endeavor_description, field_impact, national_importance, merit_evidence
+Prong 2: education, work_experience, publication, citation_metrics, research_project, recommendation, award, membership, leadership, contribution, quantitative_impact, media_coverage
+Prong 3: waiver_justification, national_benefit, beyond_employer, urgency
+General: other"""
+                    },
+                    "evidence_purpose": {
+                        "type": "string",
+                        "enum": ["direct_proof", "selectivity_proof", "credibility_proof", "impact_proof"],
+                        "description": "WHY this evidence matters: direct_proof (applicant qualification), selectivity_proof (proves prestige), credibility_proof (proves source credibility), impact_proof (proves national significance)"
+                    },
+                    "evidence_layer": {
+                        "type": "string",
+                        "enum": ["claim", "proof", "significance", "context"],
+                        "description": "Evidence pyramid layer: claim (what applicant did), proof (how to prove), significance (why it matters), context (background)"
+                    },
+                    "confidence": {"type": "number"},
+                    "reasoning": {"type": "string"}
+                },
+                "additionalProperties": False
+            }
+        },
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "type", "identity", "relation_to_applicant", "mentioned_in_blocks"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {
+                        "type": "string",
+                        "enum": ["person", "organization", "award", "publication", "position", "project", "event", "metric"]
+                    },
+                    "identity": {"type": "string", "description": "Role/title/description"},
+                    "relation_to_applicant": {
+                        "type": "string",
+                        "enum": ["self", "recommender", "mentor", "colleague", "employer", "organization", "award_giver", "other"]
+                    },
+                    "mentioned_in_blocks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": False
+            }
+        },
+        "relations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["from_entity", "relation_type", "to_entity", "context", "source_blocks"],
+                "properties": {
+                    "from_entity": {"type": "string"},
+                    "relation_type": {"type": "string"},
+                    "to_entity": {"type": "string"},
+                    "context": {"type": "string"},
+                    "source_blocks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": False
+            }
+        }
+    },
+    "additionalProperties": False
+}
+
+
+UNIFIED_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "required": ["document_summary", "snippets", "entities", "relations"],
+    "properties": {
+        "document_summary": {
+            "type": "object",
+            "required": ["document_type", "primary_subject", "key_themes"],
+            "properties": {
+                "document_type": {
+                    "type": "string",
+                    "description": "Type: resume, recommendation_letter, award_certificate, publication, media_article, other"
+                },
+                "primary_subject": {
+                    "type": "string",
+                    "description": "Main person this document is about"
+                },
+                "key_themes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Key themes or topics"
+                }
+            },
+            "additionalProperties": False
+        },
+        "snippets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["block_id", "text", "subject", "subject_role", "recommender_name", "is_applicant_achievement", "evidence_type", "evidence_purpose", "evidence_layer", "confidence", "reasoning"],
+                "properties": {
+                    "block_id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "subject": {"type": "string", "description": "Person whose achievement this is"},
+                    "subject_role": {
+                        "type": "string",
+                        "enum": ["applicant", "recommender", "evaluator", "colleague", "mentor", "peer", "organization", "other"]
+                    },
+                    "recommender_name": {
+                        "type": ["string", "null"],
+                        "description": "If from recommendation/evaluation, who is the recommender/evaluator? Use null if not applicable."
+                    },
+                    "is_applicant_achievement": {"type": "boolean"},
+                    "evidence_type": {
+                        "type": "string",
+                        "description": """Evidence type by EB-1A criterion (use these labels for consistency):
+(i) award: prizes, awards, honors
+(ii) membership, membership_criteria, membership_evaluation, peer_achievement
+(iii) media_coverage: articles ABOUT applicant; source_credibility: media credentials
+(iv) judging: judge/reviewer of others; peer_assessment: invited peer review
+(v) contribution: original contributions; quantitative_impact: metrics (NOT salary); recommendation; scientific_research_project
+(vi) publication: scholarly articles AUTHORED BY applicant
+(vii) exhibition: display of work at exhibitions
+(viii) leadership: leading role IN organization; invitation: invited to speak (NOT leadership)
+(ix) salary: applicant's pay; compensation: consulting/contract fees; salary_benchmark: industry averages
+(x) commercial_success: box office, sales, revenue data
+General: other"""
+                    },
+                    "evidence_purpose": {
+                        "type": "string",
+                        "enum": ["direct_proof", "selectivity_proof", "credibility_proof", "impact_proof"],
+                        "description": "WHY this evidence matters: direct_proof (applicant achievement), selectivity_proof (proves selectivity), credibility_proof (proves source credibility), impact_proof (proves quantitative impact)"
+                    },
+                    "evidence_layer": {
+                        "type": "string",
+                        "enum": ["claim", "proof", "significance", "context"],
+                        "description": "Evidence pyramid layer: claim (what applicant did), proof (how to prove), significance (why it matters - MOST IMPORTANT), context (background)"
+                    },
+                    "confidence": {"type": "number"},
+                    "reasoning": {"type": "string"}
+                },
+                "additionalProperties": False
+            }
+        },
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "type", "identity", "relation_to_applicant", "mentioned_in_blocks"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {
+                        "type": "string",
+                        "enum": ["person", "organization", "award", "publication", "position", "project", "event", "metric"]
+                    },
+                    "identity": {"type": "string", "description": "Role/title/description"},
+                    "relation_to_applicant": {
+                        "type": "string",
+                        "enum": ["self", "recommender", "mentor", "colleague", "employer", "organization", "award_giver", "other"]
+                    },
+                    "mentioned_in_blocks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": False
+            }
+        },
+        "relations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["from_entity", "relation_type", "to_entity", "context", "source_blocks"],
+                "properties": {
+                    "from_entity": {"type": "string"},
+                    "relation_type": {"type": "string"},
+                    "to_entity": {"type": "string"},
+                    "context": {"type": "string"},
+                    "source_blocks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": False
+            }
+        }
+    },
+    "additionalProperties": False
+}
+
+
+# ==================== L-1A Extraction Prompts ====================
+
+L1A_EXTRACTION_SYSTEM_PROMPT = """You are an expert immigration attorney assistant specializing in L-1A intracompany transferee petitions under INA §101(a)(15)(L) and 8 CFR §214.2(l).
+
+Your task is to analyze a document and extract THREE types of information:
+1. Evidence Snippets — text excerpts supporting the four L-1A legal standards
+2. Named Entities — people, organizations, positions, etc.
+3. Relationships — how entities relate to each other
+
+The applicant/beneficiary for this petition is: {applicant_name}
+
+Evidence types organized by L-1A standard:
+
+## Qualifying Corporate Relationship — INA §101(a)(15)(L); 8 CFR §214.2(l)(1)(ii)
+- corporate_structure: Company registration, incorporation, legal formation
+- ownership: Shareholding percentages, stock certificates, IRS Schedule G
+- share_transfer: Share transfer records, meeting minutes documenting ownership changes
+- physical_premises: Lease agreements, office/warehouse space, square footage, photos
+- investment: Capital transfers, bank statements showing investment from parent company
+- incorporation: Certificate of incorporation, FEIN notice, state registration
+
+## Active Business Operations — 8 CFR §214.2(l)(1)(ii)(H)
+- business_plan: Business plans, financial projections, growth targets
+- financial_performance: Revenue data, tax returns, profit figures, audit reports
+- revenue: Specific revenue/profit numbers and financial milestones
+- customer_relationship: Client lists, partnerships, cooperation agreements
+- transaction_evidence: Contracts, invoices, purchase orders, bills of lading, wire transfers
+- parent_company_info: Parent company background, operations, departments, geographic reach
+- partnership: Business partnerships, vendor relationships, supply chain
+
+## Executive/Managerial Capacity — INA §101(a)(44); 8 CFR §214.2(l)(1)(ii)(B)-(C)
+- org_chart: Organizational charts, reporting hierarchy, departmental structure
+- executive_duties: Specific executive duties with time allocation percentages
+- subordinate_credentials: Subordinate managers' names, titles, qualifications, duties
+- time_allocation: Percentage breakdown of executive working time
+
+## Qualifying Employment Abroad — 8 CFR §214.2(l)(1)(ii)(A)
+- employment_history: Beneficiary's prior positions, dates of employment
+- education: Degrees, certifications, academic background
+- achievement: Specific business achievements (contracts signed, revenue growth, partnerships)
+- contract_execution: Executed contracts, trade documents showing executive decision-making
+
+## General
+- other: Other relevant evidence
+
+CRITICAL RULES:
+- The beneficiary for this petition is: {applicant_name}
+- NAME ALIASES: The beneficiary may appear under DIFFERENT NAMES in documents
+- DOCUMENT CONTEXT MATTERS: Corporate documents about the petitioner/parent company = supporting evidence
+- Extract ALL supporting context: ownership percentages, square footage, revenue figures, employee counts
+- Do NOT skip low-confidence items — include them with appropriate confidence scores
+
+Evidence Purpose:
+- direct_proof: Directly proves a legal requirement (e.g., "majority-owned subsidiary")
+- credibility_proof: Proves credibility of source or entity (e.g., "AAA credit rating")
+- impact_proof: Proves quantitative scale or impact (e.g., "$18M gross revenue")
+- selectivity_proof: Proves qualifications or prestige (e.g., "13 years of executive experience")
+
+IMPORTANT: Extract BOTH direct evidence AND supporting evidence that proves WHY the direct evidence matters!"""
+
+
+L1A_EXTRACTION_USER_PROMPT = """Analyze this document (Exhibit {exhibit_id}) and extract structured information for an L-1A intracompany transferee petition.
+
+The beneficiary's name is: {applicant_name}
+
+## Step 1: Identify Document Context
+First, determine: What is the PRIMARY PURPOSE of this document?
+- Corporate formation document (Certificate of Incorporation, By-laws)?
+- Ownership/stock transfer record?
+- Lease agreement or premises documentation?
+- Business plan or financial projection?
+- Tax return or audit report?
+- Organizational chart?
+- Company letter describing position and duties?
+- Resume or degree certificate?
+- Transaction documents (contracts, invoices, bills of lading)?
+- Bank statements or investment records?
+
+IMPORTANT - Check for NAME ALIASES:
+- The beneficiary "{applicant_name}" may appear under DIFFERENT NAMES:
+  * English name vs Chinese name (or other language variations)
+  * Abbreviated name, nickname, or title (Ms., Mr., etc.)
+- If document is about someone with SAME SURNAME as "{applicant_name}" and the document is exhibit evidence for this beneficiary, treat that person AS the beneficiary.
+
+## Document Text Blocks
+Each block has format: [block_id] text content
+
+{blocks_text}
+
+## Instructions
+
+Extract the following in a single JSON response:
+
+1. **document_summary**: Identify document type and primary subject
+2. **snippets**: Evidence text with SUBJECT attribution
+3. **entities**: All named entities with identity and relationship to beneficiary
+4. **relations**: Relationships between entities
+
+For each SNIPPET, you MUST determine:
+- subject: Whose achievement/action is this? (exact name or "{applicant_name}")
+- subject_role: "applicant", "organization", "colleague", or "other"
+- is_applicant_achievement:
+  * TRUE if: directly about the beneficiary's qualifications/duties/achievements
+  * TRUE ALSO if: about the petitioner/parent company (supports the petition)
+  * FALSE only if: completely unrelated background information
+- evidence_type: Choose MOST SPECIFIC type from L-1A categories (see system prompt)
+- evidence_purpose: WHY does this evidence matter?
+
+CRITICAL EXAMPLES for L-1A:
+
+1. CORPORATE STRUCTURE - "[Company] is a U.S. corporation formed and registered in the State of [State] on [date]":
+   → evidence_type="incorporation", evidence_purpose="direct_proof"
+
+2. OWNERSHIP - "[Shareholder] transferred [X]% of shares to [Foreign Parent Company]":
+   → evidence_type="share_transfer", evidence_purpose="direct_proof"
+
+3. PREMISES - "The premises, covering [X] square feet, provide office and warehouse space":
+   → evidence_type="physical_premises", evidence_purpose="direct_proof"
+
+4. INVESTMENT - "The parent company transferred USD $[amount] to the Petitioner":
+   → evidence_type="investment", evidence_purpose="impact_proof"
+
+5. EXECUTIVE DUTIES - "Perform executive leadership and strategic direction (approximately [X]% of Working Time)":
+   → evidence_type="executive_duties", evidence_purpose="direct_proof"
+
+6. SUBORDINATE - "The [Title] [Name]'s duties include: oversee [Department] operations":
+   → evidence_type="subordinate_credentials", evidence_purpose="direct_proof"
+
+7. REVENUE - "Gross revenue reached $[amount] by [date]":
+   → evidence_type="revenue", evidence_purpose="impact_proof"
+
+8. EMPLOYMENT - "The Beneficiary has served as [Title] of [Company] since [date]":
+   → evidence_type="employment_history", evidence_purpose="direct_proof"
+
+9. ACHIEVEMENT - "The Beneficiary executed a supply contract with [Partner] for [product/service]":
+   → evidence_type="contract_execution", evidence_purpose="direct_proof"
+
+10. PARENT COMPANY - "[Foreign Parent Company] achieved gross revenue of [currency] [amount]":
+    → evidence_type="financial_performance", evidence_purpose="impact_proof"
+
+CRITICAL: Extract BOTH direct evidence AND supporting evidence!"""
+
+
+L1A_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "required": ["document_summary", "snippets", "entities", "relations"],
+    "properties": {
+        "document_summary": {
+            "type": "object",
+            "required": ["document_type", "primary_subject", "key_themes"],
+            "properties": {
+                "document_type": {
+                    "type": "string",
+                    "description": "Type: corporate_formation, ownership_record, lease_agreement, business_plan, tax_return, audit_report, org_chart, company_letter, resume, transaction_document, bank_statement, other"
+                },
+                "primary_subject": {
+                    "type": "string",
+                    "description": "Main entity or person this document is about"
+                },
+                "key_themes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Key themes or topics"
+                }
+            },
+            "additionalProperties": False
+        },
+        "snippets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["block_id", "text", "subject", "subject_role", "recommender_name", "is_applicant_achievement", "evidence_type", "evidence_purpose", "evidence_layer", "confidence", "reasoning"],
+                "properties": {
+                    "block_id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "subject": {"type": "string", "description": "Person or entity whose action/attribute this is"},
+                    "subject_role": {
+                        "type": "string",
+                        "enum": ["applicant", "recommender", "evaluator", "colleague", "mentor", "peer", "organization", "other"]
+                    },
+                    "recommender_name": {
+                        "type": ["string", "null"],
+                        "description": "If from recommendation/evaluation, who is the recommender/evaluator? Use null if not applicable."
+                    },
+                    "is_applicant_achievement": {"type": "boolean"},
+                    "evidence_type": {
+                        "type": "string",
+                        "description": """Evidence type by L-1A standard:
+Qualifying Relationship: corporate_structure, ownership, share_transfer, physical_premises, investment, incorporation
+Doing Business: business_plan, financial_performance, revenue, customer_relationship, transaction_evidence, parent_company_info, partnership
+Executive Capacity: org_chart, executive_duties, subordinate_credentials, time_allocation
+Qualifying Employment: employment_history, education, achievement, contract_execution
+General: other"""
+                    },
+                    "evidence_purpose": {
+                        "type": "string",
+                        "enum": ["direct_proof", "selectivity_proof", "credibility_proof", "impact_proof"],
+                        "description": "WHY this evidence matters: direct_proof (proves legal requirement), credibility_proof (proves entity credibility), impact_proof (proves quantitative scale), selectivity_proof (proves qualifications)"
+                    },
+                    "evidence_layer": {
+                        "type": "string",
+                        "enum": ["claim", "proof", "significance", "context"],
+                        "description": "Evidence pyramid layer: claim (legal point), proof (supporting fact), significance (why it matters), context (background)"
+                    },
+                    "confidence": {"type": "number"},
+                    "reasoning": {"type": "string"}
+                },
+                "additionalProperties": False
+            }
+        },
+        "entities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "type", "identity", "relation_to_applicant", "mentioned_in_blocks"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {
+                        "type": "string",
+                        "enum": ["person", "organization", "award", "publication", "position", "project", "event", "metric"]
+                    },
+                    "identity": {"type": "string", "description": "Role/title/description"},
+                    "relation_to_applicant": {
+                        "type": "string",
+                        "enum": ["self", "recommender", "mentor", "colleague", "employer", "organization", "award_giver", "other"]
+                    },
+                    "mentioned_in_blocks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": False
+            }
+        },
+        "relations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["from_entity", "relation_type", "to_entity", "context", "source_blocks"],
+                "properties": {
+                    "from_entity": {"type": "string"},
+                    "relation_type": {"type": "string"},
+                    "to_entity": {"type": "string"},
+                    "context": {"type": "string"},
+                    "source_blocks": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": False
+            }
+        }
+    },
+    "additionalProperties": False
+}
+
+
+# ==================== Helper Functions ====================
+
+def generate_snippet_id(exhibit_id: str, page: int, text: str) -> str:
+    """确定性 snippet ID: 同 exhibit + page + text → 同 ID"""
+    normalized = text.strip().lower()[:100]
+    content = f"{exhibit_id}:{page}:{normalized}"
+    hash_str = hashlib.md5(content.encode('utf-8')).hexdigest()[:8]
+    return f"snp_{exhibit_id}_{hash_str}"
+
+
+def generate_entity_id(exhibit_id: str, index: int) -> str:
+    """生成唯一 entity ID"""
+    return f"ent_{exhibit_id}_{index}"
+
+
+def generate_relation_id(exhibit_id: str, index: int) -> str:
+    """生成唯一 relation ID"""
+    return f"rel_{exhibit_id}_{index}"
+
+
+def _infer_evidence_layer(item: Dict) -> str:
+    """根据 evidence_purpose 和 evidence_type 推断证据层级"""
+    purpose = item.get("evidence_purpose", "direct_proof")
+    etype = item.get("evidence_type", "other")
+
+    # significance 层：selectivity/credibility/impact proof
+    if purpose in ["selectivity_proof", "credibility_proof", "impact_proof"]:
+        return "significance"
+
+    # significance 层的证据类型
+    if etype in ["peer_achievement", "source_credibility", "quantitative_impact",
+                  "membership_criteria", "salary_benchmark"]:
+        return "significance"
+
+    # proof 层：证明申请人的声明
+    if etype in ["award", "membership_evaluation", "peer_assessment", "recommendation"]:
+        return "proof"
+
+    # claim 层：直接声明（主要证据类型）
+    if etype in ["membership", "media_coverage", "judging", "contribution", "publication",
+                  "exhibition", "leadership", "salary", "compensation", "commercial_success",
+                  "scientific_research_project"]:
+        return "claim"
+
+    # context 层：背景信息
+    return "context"
+
+
+_COVER_PAGE_RE = re.compile(
+    r"^#?\s*exhibit\s+[a-z][-–]?\d+\s*$", re.IGNORECASE
+)
+
+
+def _is_cover_page(page_data: Dict) -> bool:
+    """Detect exhibit cover pages that contain only a label like 'Exhibit A-1'."""
+    md = page_data.get("markdown_text", "").strip()
+    if len(md) < 30 and _COVER_PAGE_RE.match(md):
+        return True
+    blocks = page_data.get("text_blocks", [])
+    if len(blocks) <= 1:
+        texts = [b.get("text_content", "").strip() for b in blocks]
+        combined = " ".join(texts).strip()
+        if len(combined) < 30 and _COVER_PAGE_RE.match(combined):
+            return True
+    return False
+
+
+async def _llm_match_blocks(
+    unmatched_snippets: List[Dict],
+    block_map: Dict,
+    exhibit_id: str,
+    provider: str = "deepseek",
+) -> Dict[int, str]:
+    """Layer 3: 用 LLM 为无法文本匹配的 snippet 找到正确的 block_id。
+
+    Args:
+        unmatched_snippets: [{"idx": int, "text": str}, ...]
+        block_map: {composite_id: (page_num, block)}
+        exhibit_id: exhibit ID
+        provider: LLM provider
+
+    Returns:
+        {snippet_idx: matched_composite_id}
+    """
+    if not unmatched_snippets or not block_map:
+        return {}
+
+    # 构建 block 列表（只保留有实际内容的 block，截断过长的 block text）
+    block_list = []
+    for cid, (pn, blk) in block_map.items():
+        text = blk.get("text_content", "").strip()
+        if not text:
+            continue
+        preview = text[:300] + ("..." if len(text) > 300 else "")
+        block_list.append(f"[{cid}] (page {pn}, {len(text)} chars) {preview}")
+
+    blocks_text = "\n".join(block_list)
+
+    # 构建 snippet 列表
+    snippet_entries = []
+    for item in unmatched_snippets:
+        idx = item["idx"]
+        text = item["text"][:200] + ("..." if len(item["text"]) > 200 else "")
+        snippet_entries.append(f"SNIPPET_{idx}: \"{text}\"")
+
+    snippets_text = "\n".join(snippet_entries)
+
+    prompt = f"""You are matching extracted text snippets to their source blocks in a document.
+
+Each snippet was extracted from one of the blocks below, but the block_id was lost.
+For each snippet, find the block that BEST CONTAINS or MATCHES the snippet text.
+
+## Available Blocks (Exhibit {exhibit_id})
+{blocks_text}
+
+## Snippets to Match
+{snippets_text}
+
+## Instructions
+For each snippet, output the block_id of the block that most likely contains that text.
+Look for keyword overlap, topic similarity, or partial text matches.
+
+Return JSON:
+{{
+  "matches": [
+    {{"snippet": "SNIPPET_0", "block_id": "p3_b2", "confidence": 0.9}},
+    ...
+  ]
+}}"""
+
+    try:
+        result = await call_llm(
+            prompt=prompt,
+            provider=provider,
+            system_prompt="You match text snippets to source document blocks. Return only valid JSON.",
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        matches_raw = result.get("matches", [])
+        matched = {}
+        for m in matches_raw:
+            snip_key = m.get("snippet", "")
+            block_id = m.get("block_id", "")
+            # 解析 SNIPPET_{idx}
+            if snip_key.startswith("SNIPPET_") and block_id in block_map:
+                try:
+                    idx = int(snip_key.split("_")[1])
+                    matched[idx] = block_id
+                except (ValueError, IndexError):
+                    pass
+        print(f"[BlockVerify] {exhibit_id}: LLM matched {len(matched)}/{len(unmatched_snippets)} snippets")
+        return matched
+    except Exception as e:
+        print(f"[BlockVerify] {exhibit_id}: LLM matching failed: {e}")
+        return {}
+
+
+def format_blocks_for_llm(pages: List[Dict]) -> Tuple[str, Dict]:
+    """将所有页的 blocks 格式化为 LLM 输入格式
+
+    Returns:
+        tuple: (blocks_text, block_map)
+            - blocks_text: 格式化后的文本
+            - block_map: {composite_id -> (page_num, block)} 的映射
+    """
+    lines = []
+    block_map = {}
+
+    for page_data in pages:
+        page_num = page_data.get("page_number", 0)
+
+        # Skip exhibit cover pages (e.g. pages containing only "Exhibit A-1")
+        if _is_cover_page(page_data):
+            continue
+
+        blocks = page_data.get("text_blocks", [])
+
+        for block in blocks:
+            block_id = block.get("block_id", "")
+            text = block.get("text_content", "").strip()
+
+            # 跳过空文本或太短的文本
+            if not text or len(text) < 5:
+                continue
+
+            # Use block_id directly if it already encodes page info (e.g. "p2_b0"),
+            # otherwise prefix with page number to avoid collisions
+            if block_id and re.match(r"p\d+_", block_id):
+                composite_id = block_id
+            else:
+                composite_id = f"p{page_num}_{block_id}"
+            block_map[composite_id] = (page_num, block)
+            lines.append(f"[{composite_id}] {text}")
+
+    return "\n".join(lines), block_map
+
+
+def get_extraction_dir(project_id: str) -> Path:
+    """获取提取结果目录"""
+    extraction_dir = PROJECTS_DIR / project_id / "extraction"
+    extraction_dir.mkdir(parents=True, exist_ok=True)
+    return extraction_dir
+
+
+def get_entities_dir(project_id: str) -> Path:
+    """获取实体目录"""
+    entities_dir = PROJECTS_DIR / project_id / "entities"
+    entities_dir.mkdir(parents=True, exist_ok=True)
+    return entities_dir
+
+
+# ==================== Core Functions ====================
+
+async def extract_exhibit_unified(
+    project_id: str,
+    exhibit_id: str,
+    applicant_name: str,
+    provider: str = "deepseek",
+    project_type: str = "EB-1A"
+) -> Dict:
+    """
+    统一提取单个 exhibit 的 snippets + entities + relations
+
+    Args:
+        project_id: 项目 ID
+        exhibit_id: Exhibit ID
+        applicant_name: 申请人姓名
+        provider: LLM 提供商 ("deepseek" 或 "openai")
+        project_type: "EB-1A" or "NIW"
+
+    Returns:
+        提取结果 dict
+    """
+    # 1. 加载文档
+    doc_path = PROJECTS_DIR / project_id / "documents" / f"{exhibit_id}.json"
+    if not doc_path.exists():
+        raise FileNotFoundError(f"Document not found: {doc_path}")
+
+    with open(doc_path, 'r', encoding='utf-8') as f:
+        doc_data = json.load(f)
+
+    pages = doc_data.get("pages", [])
+    if not pages:
+        return {
+            "success": False,
+            "error": f"No pages in exhibit {exhibit_id}",
+            "exhibit_id": exhibit_id
+        }
+
+    print(f"[UnifiedExtractor] Processing exhibit {exhibit_id} ({len(pages)} pages)...")
+
+    # 2. 格式化 blocks
+    blocks_text, block_map = format_blocks_for_llm(pages)
+
+    if not blocks_text or len(blocks_text) < 50:
+        return {
+            "success": False,
+            "error": f"Not enough text content in {exhibit_id}",
+            "exhibit_id": exhibit_id
+        }
+
+    # 3. 构建 prompt — 根据 project_type 选择
+    if project_type == "NIW":
+        system_prompt = NIW_EXTRACTION_SYSTEM_PROMPT.format(applicant_name=applicant_name)
+        user_prompt = NIW_EXTRACTION_USER_PROMPT.format(
+            exhibit_id=exhibit_id,
+            applicant_name=applicant_name,
+            blocks_text=blocks_text
+        )
+        extraction_schema = NIW_EXTRACTION_SCHEMA
+    elif project_type == "L-1A":
+        system_prompt = L1A_EXTRACTION_SYSTEM_PROMPT.format(applicant_name=applicant_name)
+        user_prompt = L1A_EXTRACTION_USER_PROMPT.format(
+            exhibit_id=exhibit_id,
+            applicant_name=applicant_name,
+            blocks_text=blocks_text
+        )
+        extraction_schema = L1A_EXTRACTION_SCHEMA
+    else:
+        system_prompt = UNIFIED_EXTRACTION_SYSTEM_PROMPT.format(applicant_name=applicant_name)
+        user_prompt = UNIFIED_EXTRACTION_USER_PROMPT.format(
+            exhibit_id=exhibit_id,
+            applicant_name=applicant_name,
+            blocks_text=blocks_text
+        )
+        extraction_schema = UNIFIED_EXTRACTION_SCHEMA
+
+    # 4. 调用 LLM
+    print(f"[UnifiedExtractor] Calling LLM ({provider}) for {exhibit_id} (project_type={project_type})...")
+
+    try:
+        result = await call_llm(
+            prompt=user_prompt,
+            provider=provider,
+            system_prompt=system_prompt,
+            json_schema=extraction_schema,
+            temperature=0.2,   # 提高到 0.2：允许更多变化，更好地识别上下文
+            max_tokens=8000   # DeepSeek 限制 8192，使用 8000 留余量
+        )
+    except Exception as e:
+        print(f"[UnifiedExtractor] LLM error for {exhibit_id}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "exhibit_id": exhibit_id
+        }
+
+    # 5. 处理结果
+    document_summary = result.get("document_summary", {})
+    raw_snippets = result.get("snippets", [])
+    raw_entities = result.get("entities", [])
+    raw_relations = result.get("relations", [])
+
+    # 6. 处理 snippets - 添加 ID 和 bbox
+    # 使用分层置信度阈值：支持性内容（如 membership_criteria）用更低阈值
+    CONFIDENCE_THRESHOLDS = {
+        # EB-1A types
+        "award": 0.5,
+        "membership": 0.4,
+        "membership_criteria": 0.3,
+        "membership_evaluation": 0.3,
+        "peer_assessment": 0.3,
+        "media_coverage": 0.4,
+        "recommendation": 0.4,
+        "contribution": 0.4,
+        "leadership": 0.4,
+        "judging": 0.4,
+        "publication": 0.4,
+        "salary": 0.3,
+        "compensation": 0.3,
+        "salary_benchmark": 0.3,
+        "exhibition": 0.4,
+        "commercial_success": 0.4,
+        # NIW Prong 1 types
+        "endeavor_description": 0.3,
+        "field_impact": 0.3,
+        "national_importance": 0.3,
+        "merit_evidence": 0.3,
+        # NIW Prong 2 types
+        "education": 0.3,
+        "work_experience": 0.3,
+        "citation_metrics": 0.3,
+        "research_project": 0.3,
+        "quantitative_impact": 0.3,
+        # NIW Prong 3 types
+        "waiver_justification": 0.3,
+        "national_benefit": 0.3,
+        "beyond_employer": 0.3,
+        "urgency": 0.3,
+    }
+    DEFAULT_THRESHOLD = 0.35
+
+    processed_snippets = []
+    seen_snippet_ids = set()  # 确定性 ID 去重
+    pending_llm_match = []  # Layer 3: 收集需要 LLM 匹配的 snippet
+
+    def _build_snippet_dict(item, composite_id, page_block):
+        """从 raw item + 匹配到的 block 构建 processed snippet dict。
+        Returns None if duplicate snippet_id (deterministic dedup)."""
+        page_num, block = page_block
+        original_block_id = block.get("block_id", "")
+        snippet_id = generate_snippet_id(exhibit_id, page_num, item.get("text", ""))
+        if snippet_id in seen_snippet_ids:
+            return None
+        seen_snippet_ids.add(snippet_id)
+        return {
+            "snippet_id": snippet_id,
+            "exhibit_id": exhibit_id,
+            "document_id": f"doc_{exhibit_id}",
+            "text": item.get("text", ""),
+            "page": page_num,
+            "bbox": block.get("bbox"),
+            "block_id": original_block_id,
+            "subject": item.get("subject", applicant_name),
+            "subject_role": item.get("subject_role", "applicant"),
+            "recommender_name": item.get("recommender_name"),
+            "is_applicant_achievement": item.get("is_applicant_achievement", True),
+            "evidence_type": item.get("evidence_type", "other"),
+            "evidence_purpose": item.get("evidence_purpose", "direct_proof"),
+            "evidence_layer": item.get("evidence_layer", _infer_evidence_layer(item)),
+            "confidence": item.get("confidence", 0.5),
+            "reasoning": item.get("reasoning", ""),
+            "is_ai_suggested": True,
+            "is_confirmed": False
+        }
+
+    for item in raw_snippets:
+        evidence_type = item.get("evidence_type", "other")
+        threshold = CONFIDENCE_THRESHOLDS.get(evidence_type, DEFAULT_THRESHOLD)
+
+        # 处理 confidence - DeepSeek 可能返回 None 或非数字
+        confidence = item.get("confidence")
+        if confidence is None or not isinstance(confidence, (int, float)):
+            confidence = 0.5  # 默认置信度
+
+        if confidence < threshold:
+            continue
+
+        composite_id = item.get("block_id", "")
+        snippet_text = item.get("text", "")
+
+        # 处理合并的 block_id (如 "p2_p2_b1-p2_p2_b2")
+        # 取第一个 block_id
+        if composite_id and "-" in composite_id and "_" in composite_id:
+            composite_id = composite_id.split("-")[0]
+
+        page_block = block_map.get(composite_id)
+
+        # 如果找不到，尝试模糊匹配
+        if not page_block and composite_id:
+            for key in block_map.keys():
+                if key.endswith(composite_id.split("_")[-1]) or composite_id in key:
+                    page_block = block_map[key]
+                    composite_id = key
+                    break
+
+        # ── 三层 block_id 校验 ──────────────────────────────────
+        # Layer 1: 验证 — 即使 block_id 找到了，也检查 snippet 文本是否真的在那个 block 里
+        if page_block and snippet_text:
+            _, found_block = page_block
+            block_text = found_block.get("text_content", "")
+            snippet_norm_check = re.sub(r'\s+', ' ', snippet_text.lower().strip())
+            block_norm_check = re.sub(r'\s+', ' ', block_text.lower().strip())
+            # Check 1: 如果 snippet 远长于 block（2x），说明 block_id 分配错误
+            length_mismatch = len(snippet_text) > len(block_text) * 2 and len(snippet_text) > 20
+            # Check 2: 如果 snippet 前 50 字符不在 block 中且 block 前 50 字符不在 snippet 中，说明内容不匹配
+            content_mismatch = (
+                len(snippet_norm_check) > 20 and len(block_norm_check) > 20
+                and snippet_norm_check[:50] not in block_norm_check
+                and block_norm_check[:50] not in snippet_norm_check
+            )
+            if length_mismatch or content_mismatch:
+                reason = "length" if length_mismatch else "content"
+                print(f"[BlockVerify] {exhibit_id}: snippet text ({len(snippet_text)} chars) vs block {composite_id} ({len(block_text)} chars) {reason} mismatch, searching correct block...")
+                page_block = None  # 触发 Layer 2
+
+        # Layer 2: 文本匹配 — 在所有 block 中搜索包含 snippet 文本的 block
+        if not page_block and snippet_text and len(snippet_text) > 10:
+            snippet_norm = re.sub(r'\s+', ' ', snippet_text.lower().strip())
+            best_match = None
+            best_score = 0
+            for cid, (pn, blk) in block_map.items():
+                blk_text = blk.get("text_content", "")
+                blk_norm = re.sub(r'\s+', ' ', blk_text.lower().strip())
+                if not blk_norm:
+                    continue
+                # 完整子串匹配
+                if snippet_norm in blk_norm:
+                    score = len(snippet_norm) / max(len(blk_norm), 1)
+                    if score > best_score:
+                        best_match = cid
+                        best_score = score
+            # 如果完整匹配没找到，尝试前 80 字符部分匹配
+            if not best_match and len(snippet_norm) > 80:
+                probe = snippet_norm[:80]
+                for cid, (pn, blk) in block_map.items():
+                    blk_norm = re.sub(r'\s+', ' ', blk.get("text_content", "").lower().strip())
+                    if probe in blk_norm:
+                        best_match = cid
+                        break
+            if best_match:
+                page_block = block_map[best_match]
+                composite_id = best_match
+                print(f"[BlockVerify] {exhibit_id}: text-matched to {best_match}")
+
+        # Layer 3: 收集无法文本匹配的 snippet，等待批量 LLM 匹配
+        if not page_block:
+            pending_llm_match.append({
+                "idx": len(pending_llm_match),
+                "text": snippet_text,
+                "item": item,  # 保留完整的 raw item 用于后续构建 snippet
+            })
+            continue
+
+        built = _build_snippet_dict(item, composite_id, page_block)
+        if built:
+            processed_snippets.append(built)
+
+    # ── Layer 3: 批量 LLM 匹配 ──────────────────────────────────
+    if pending_llm_match:
+        print(f"[BlockVerify] {exhibit_id}: {len(pending_llm_match)} snippets need LLM matching...")
+        llm_results = await _llm_match_blocks(
+            pending_llm_match, block_map, exhibit_id, provider
+        )
+        for pending in pending_llm_match:
+            idx = pending["idx"]
+            matched_cid = llm_results.get(idx)
+            if matched_cid and matched_cid in block_map:
+                page_block = block_map[matched_cid]
+                built = _build_snippet_dict(pending["item"], matched_cid, page_block)
+                if built:
+                    processed_snippets.append(built)
+            else:
+                print(f"[BlockVerify] {exhibit_id}: LLM could not match snippet (text: '{pending['text'][:60]}...'), skipping")
+
+    # 7. 处理 entities - 添加 ID
+    processed_entities = []
+    for idx, item in enumerate(raw_entities):
+        entity_id = generate_entity_id(exhibit_id, idx)
+        processed_entities.append({
+            "id": entity_id,
+            "name": item.get("name", ""),
+            "type": item.get("type", "other"),
+            "identity": item.get("identity", ""),
+            "relation_to_applicant": item.get("relation_to_applicant", "other"),
+            "snippet_ids": [],  # 将在后处理中填充
+            "exhibit_ids": [exhibit_id],
+            "mentioned_in_blocks": item.get("mentioned_in_blocks", []),
+            "aliases": [],
+            "is_merged": False,
+            "merged_from": []
+        })
+
+    # 8. 处理 relations - 添加 ID
+    processed_relations = []
+    for idx, item in enumerate(raw_relations):
+        relation_id = generate_relation_id(exhibit_id, idx)
+        processed_relations.append({
+            "id": relation_id,
+            "from_entity": item.get("from_entity", ""),
+            "to_entity": item.get("to_entity", ""),
+            "relation_type": item.get("relation_type", ""),
+            "context": item.get("context", ""),
+            "source_snippet_ids": [],  # 将在后处理中填充
+            "source_blocks": item.get("source_blocks", [])
+        })
+
+    # 9. 保存提取结果
+    extraction_result = {
+        "version": "4.0",
+        "exhibit_id": exhibit_id,
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+        "applicant_name": applicant_name,
+
+        "document_summary": document_summary,
+
+        "snippets": processed_snippets,
+        "entities": processed_entities,
+        "relations": processed_relations,
+
+        "stats": {
+            "snippet_count": len(processed_snippets),
+            "entity_count": len(processed_entities),
+            "relation_count": len(processed_relations),
+            "applicant_snippets": sum(1 for s in processed_snippets if s.get("is_applicant_achievement")),
+            "other_snippets": sum(1 for s in processed_snippets if not s.get("is_applicant_achievement"))
+        }
+    }
+
+    # 保存到文件
+    extraction_dir = get_extraction_dir(project_id)
+    extraction_file = extraction_dir / f"{exhibit_id}_extraction.json"
+    with open(extraction_file, 'w', encoding='utf-8') as f:
+        json.dump(extraction_result, f, ensure_ascii=False, indent=2)
+
+    print(f"[UnifiedExtractor] {exhibit_id}: {len(processed_snippets)} snippets, {len(processed_entities)} entities, {len(processed_relations)} relations")
+
+    return {
+        "success": True,
+        "exhibit_id": exhibit_id,
+        **extraction_result["stats"]
+    }
+
+
+async def extract_all_unified(
+    project_id: str,
+    applicant_name: str,
+    provider: str = "deepseek",
+    progress_callback=None,
+    project_type: str = "EB-1A"
+) -> Dict:
+    """
+    提取项目中所有 exhibits
+
+    Args:
+        project_id: 项目 ID
+        applicant_name: 申请人姓名
+        provider: LLM 提供商 ("deepseek" 或 "openai")
+        progress_callback: 进度回调 (current, total, message)
+        project_type: "EB-1A" or "NIW"
+
+    Returns:
+        提取结果汇总
+    """
+    documents_dir = PROJECTS_DIR / project_id / "documents"
+
+    if not documents_dir.exists():
+        return {
+            "success": False,
+            "error": "Documents directory not found"
+        }
+
+    exhibit_files = list(documents_dir.glob("*.json"))
+    total_exhibits = len(exhibit_files)
+
+    print(f"[UnifiedExtractor] Starting extraction for {total_exhibits} exhibits, applicant: {applicant_name}")
+
+    all_snippets = []
+    all_entities = []
+    all_relations = []
+
+    successful = 0
+    failed = 0
+
+    # 并发提取 — 使用 semaphore 限流，避免 API 过载
+    CONCURRENCY = 5
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    completed_count = 0
+
+    async def _extract_one(exhibit_file):
+        nonlocal successful, failed, completed_count
+        exhibit_id = exhibit_file.stem
+
+        async with semaphore:
+            try:
+                result = await extract_exhibit_unified(
+                    project_id, exhibit_id, applicant_name,
+                    provider=provider, project_type=project_type
+                )
+                completed_count += 1
+
+                if progress_callback:
+                    progress_callback(completed_count, total_exhibits, f"Extracted {exhibit_id}")
+
+                return exhibit_id, result
+            except Exception as e:
+                completed_count += 1
+                print(f"[UnifiedExtractor] Exception extracting {exhibit_id}: {e}")
+                return exhibit_id, {"success": False, "error": str(e)}
+
+    print(f"[UnifiedExtractor] Extracting {total_exhibits} exhibits with concurrency={CONCURRENCY}...")
+    tasks = [_extract_one(ef) for ef in exhibit_files]
+    results = await asyncio.gather(*tasks)
+
+    # 收集结果
+    for exhibit_id, result in results:
+        if result.get("success"):
+            successful += 1
+            extraction_file = get_extraction_dir(project_id) / f"{exhibit_id}_extraction.json"
+            if extraction_file.exists():
+                with open(extraction_file, 'r', encoding='utf-8') as f:
+                    extraction_data = json.load(f)
+                all_snippets.extend(extraction_data.get("snippets", []))
+                all_entities.extend(extraction_data.get("entities", []))
+                all_relations.extend(extraction_data.get("relations", []))
+        else:
+            failed += 1
+            print(f"[UnifiedExtractor] Failed {exhibit_id}: {result.get('error')}")
+
+    if progress_callback:
+        progress_callback(total_exhibits, total_exhibits, "Saving combined results...")
+
+    # 保存合并后的结果
+    combined_result = {
+        "version": "4.0",
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+        "applicant_name": applicant_name,
+        "exhibit_count": total_exhibits,
+        "successful": successful,
+        "failed": failed,
+
+        "snippets": all_snippets,
+        "entities": all_entities,
+        "relations": all_relations,
+
+        "stats": {
+            "total_snippets": len(all_snippets),
+            "total_entities": len(all_entities),
+            "total_relations": len(all_relations),
+            "applicant_snippets": sum(1 for s in all_snippets if s.get("is_applicant_achievement")),
+            "other_snippets": sum(1 for s in all_snippets if not s.get("is_applicant_achievement"))
+        }
+    }
+
+    # 保存合并结果
+    extraction_dir = get_extraction_dir(project_id)
+    combined_file = extraction_dir / "combined_extraction.json"
+    with open(combined_file, 'w', encoding='utf-8') as f:
+        json.dump(combined_result, f, ensure_ascii=False, indent=2)
+
+    # 同步到 snippet registry（provenance_engine 等读取）
+    build_registry_from_combined_extraction(project_id)
+
+    # 同时保存到 snippets 目录（兼容现有代码）
+    snippets_dir = PROJECTS_DIR / project_id / "snippets"
+    snippets_dir.mkdir(parents=True, exist_ok=True)
+    snippets_file = snippets_dir / "extracted_snippets.json"
+
+    snippets_data = {
+        "version": "4.0",
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+        "snippet_count": len(all_snippets),
+        "extraction_method": "unified_extraction",
+        "model": getattr(settings, 'openai_model', 'gpt-4o'),
+        "snippets": all_snippets
+    }
+
+    with open(snippets_file, 'w', encoding='utf-8') as f:
+        json.dump(snippets_data, f, ensure_ascii=False, indent=2)
+
+    print(f"[UnifiedExtractor] Complete: {successful}/{total_exhibits} exhibits, {len(all_snippets)} snippets, {len(all_entities)} entities")
+
+    return {
+        "success": True,
+        "exhibit_count": total_exhibits,
+        "successful": successful,
+        "failed": failed,
+        **combined_result["stats"]
+    }
+
+
+def load_combined_extraction(project_id: str) -> Optional[Dict]:
+    """加载合并后的提取结果"""
+    combined_file = get_extraction_dir(project_id) / "combined_extraction.json"
+    if combined_file.exists():
+        with open(combined_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+
+def load_exhibit_extraction(project_id: str, exhibit_id: str) -> Optional[Dict]:
+    """加载单个 exhibit 的提取结果"""
+    extraction_file = get_extraction_dir(project_id) / f"{exhibit_id}_extraction.json"
+    if extraction_file.exists():
+        with open(extraction_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return None
+
+
+def get_extraction_status(project_id: str) -> Dict:
+    """获取提取状态"""
+    extraction_dir = get_extraction_dir(project_id)
+    documents_dir = PROJECTS_DIR / project_id / "documents"
+
+    # 统计已提取的 exhibits
+    extracted_exhibits = []
+    if extraction_dir.exists():
+        for f in extraction_dir.glob("*_extraction.json"):
+            exhibit_id = f.stem.replace("_extraction", "")
+            extracted_exhibits.append(exhibit_id)
+
+    # 统计所有 exhibits
+    all_exhibits = []
+    if documents_dir.exists():
+        all_exhibits = [f.stem for f in documents_dir.glob("*.json")]
+
+    # 检查合并结果
+    combined_file = extraction_dir / "combined_extraction.json"
+    has_combined = combined_file.exists()
+
+    combined_stats = None
+    if has_combined:
+        with open(combined_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            combined_stats = data.get("stats")
+
+    return {
+        "total_exhibits": len(all_exhibits),
+        "extracted_exhibits": len(extracted_exhibits),
+        "extracted_exhibit_ids": extracted_exhibits,
+        "pending_exhibits": [e for e in all_exhibits if e not in extracted_exhibits],
+        "has_combined_extraction": has_combined,
+        "combined_stats": combined_stats
+    }

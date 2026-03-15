@@ -1,0 +1,154 @@
+{
+  "common": {
+    "next": "下一步",
+    "back": "返回",
+    "submit": "提交",
+    "cancel": "取消",
+    "required": "必填",
+    "participantId": "参与者 ID",
+    "language": "语言",
+    "progress": "进度",
+    "timer": "已用时间"
+  },
+  "welcome": {
+    "title": "欢迎参加用户研究",
+    "subtitle": "证据优先写作系统评估",
+    "description": "感谢您参与本研究。您将阅读并评估请愿信，然后完成交互式任务。整个研究大约需要 45-60 分钟。",
+    "enterIdPlaceholder": "请输入您的参与者 ID",
+    "enterIdHint": "请输入研究人员提供的参与者 ID。",
+    "start": "开始研究",
+    "resumePrompt": "我们找到了此 ID 的先前会话。是否要恢复？",
+    "resume": "恢复",
+    "startNew": "重新开始"
+  },
+  "consent": {
+    "title": "知情同意书",
+    "purpose": "研究目的",
+    "purposeText": "本研究旨在评估不同的移民案件请愿信生成方法。您的参与将帮助我们了解这些方法的有效性和可用性。",
+    "procedures": "研究流程",
+    "proceduresText": "您将：(1) 阅读并比较由不同系统生成的请愿信，(2) 从多个维度对它们进行评分，(3) 使用交互式系统完成写作任务，(4) 回答关于您体验的问卷。",
+    "risks": "风险与收益",
+    "risksText": "本研究风险极低。您可能会因阅读和评估文本而感到轻微疲劳。您将按照招募材料中的说明获得报酬。",
+    "confidentiality": "保密性",
+    "confidentialityText": "您的回答将被匿名化并安全存储。出版物中仅报告汇总结果。您的参与者 ID 无法与您的身份关联。",
+    "voluntary": "自愿参与",
+    "voluntaryText": "您的参与是自愿的。您可以随时退出，不会受到任何处罚。",
+    "agree": "我已阅读并理解以上信息，同意参与本研究。",
+    "continue": "同意并继续"
+  },
+  "demographics": {
+    "title": "背景信息",
+    "age": "年龄",
+    "agePlaceholder": "例如：28",
+    "gender": "性别",
+    "genderOptions": {
+      "male": "男",
+      "female": "女",
+      "nonbinary": "非二元",
+      "preferNot": "不愿透露",
+      "other": "其他"
+    },
+    "education": "最高学历",
+    "educationOptions": {
+      "highschool": "高中",
+      "bachelors": "学士",
+      "masters": "硕士",
+      "doctorate": "博士",
+      "other": "其他"
+    },
+    "field": "专业/工作领域",
+    "fieldPlaceholder": "例如：计算机科学、法律",
+    "legalExperience": "法律文书经验",
+    "legalExperienceOptions": {
+      "none": "无",
+      "some": "少许（阅读过一些法律文件）",
+      "moderate": "中等（工作偶尔涉及法律文本）",
+      "extensive": "丰富（法律专业人士或研究人员）"
+    },
+    "aiExperience": "AI 写作工具使用经验",
+    "aiExperienceOptions": {
+      "none": "无",
+      "casual": "偶尔使用",
+      "regular": "经常使用",
+      "expert": "专家/开发者"
+    }
+  },
+  "phase1": {
+    "title": "第一阶段：对比评估",
+    "instruction": "请仔细阅读以下三封由不同系统为同一案件生成的请愿信。阅读后，您将从多个维度对每封信进行评分。",
+    "systemA": "系统 A",
+    "systemB": "系统 B",
+    "systemC": "系统 C",
+    "readComplete": "我已阅读完毕，开始评分",
+    "scoringTitle": "为每个系统评分",
+    "scoringInstruction": "对于以下每个维度，拖动滑块为每个系统打分（0-100）。",
+    "poor": "差",
+    "excellent": "优",
+    "comment": "评论（可选）",
+    "commentPlaceholder": "对该系统输出的其他想法...",
+    "submitRatings": "提交评分",
+    "confirmSubmit": "确定要提交吗？提交后无法修改评分。",
+    "material": "材料集"
+  },
+  "phase2": {
+    "title": "第二阶段：交互式任务",
+    "instruction": "您现在将使用交互式系统完成一项写作任务。请仔细按照说明操作。",
+    "taskDescription": "使用系统审阅案件材料并为给定案件生成请愿信。",
+    "startTask": "开始任务",
+    "completeTask": "完成任务",
+    "taskComplete": "任务完成。请回答几个关于您体验的问题。",
+    "condition": "条件",
+    "connectionError": "无法连接到主系统",
+    "connectionErrorHint": "请确保主系统已在 localhost:5173 上运行，然后重试。",
+    "retry": "重试",
+    "skip": "跳过",
+    "loading": "正在加载系统..."
+  },
+  "postTask": {
+    "title": "任务后问卷",
+    "mentalDemand": "脑力需求",
+    "mentalDemandDesc": "这项任务对脑力的要求有多高？",
+    "effort": "努力程度",
+    "effortDesc": "您为达到当前表现水平付出了多大努力？",
+    "frustration": "挫败感",
+    "frustrationDesc": "您感到多大程度的不安、沮丧、烦躁、压力或恼怒？",
+    "satisfaction": "满意度",
+    "satisfactionDesc": "您对自己产出的结果有多满意？",
+    "low": "非常低",
+    "high": "非常高"
+  },
+  "postStudy": {
+    "title": "研究后问卷",
+    "overallPreference": "总体偏好",
+    "overallPreferenceDesc": "您觉得哪个系统总体上最有用？",
+    "systemOptions": {
+      "a": "系统 A",
+      "b": "系统 B",
+      "c": "系统 C"
+    },
+    "openFeedback": "开放反馈",
+    "openFeedbackDesc": "请分享您对本次体验的任何其他想法、建议或评论。",
+    "openFeedbackPlaceholder": "您的想法..."
+  },
+  "thankYou": {
+    "title": "感谢您！",
+    "message": "您的回答已成功记录。感谢您对本研究的宝贵参与。",
+    "downloadData": "下载我的数据 (JSON)",
+    "studyComplete": "您现在可以关闭此窗口。",
+    "contactInfo": "如有任何问题，请联系研究团队。"
+  },
+  "admin": {
+    "title": "研究管理",
+    "participantCount": "参与者数量",
+    "exportAll": "导出所有数据 (JSON)",
+    "exportCsv": "导出第一阶段评分 (CSV)",
+    "noData": "未找到参与者数据。",
+    "participantList": "参与者记录",
+    "currentStep": "当前步骤",
+    "completedAt": "完成时间",
+    "delete": "删除",
+    "confirmDelete": "确定要删除此参与者的数据吗？",
+    "clearAll": "清除所有数据",
+    "confirmClearAll": "这将删除所有参与者数据。确定吗？"
+  }
+}
